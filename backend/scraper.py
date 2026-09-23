@@ -13,6 +13,7 @@ from urllib.parse import urlparse, parse_qs
 import httpx
 from camoufox.async_api import AsyncCamoufox
 import db
+from queue_manager import queue_manager, QueueCancelledException
 
 LOGIN_URL = "https://auth1.diu.edu.bd/realms/diu-student/protocol/openid-connect/auth?client_id=student-portal-ui&redirect_uri=https%3A%2F%2Fstudentportal.diu.edu.bd%2F&response_type=code&scope=openid+profile+email"
 TOKEN_URL = "https://auth1.diu.edu.bd/realms/diu-student/protocol/openid-connect/token"
@@ -20,9 +21,6 @@ GATEWAY_BASE = "https://gateway7.diu.edu.bd/api/student/portal"
 
 # Registry for active interactive browser sessions
 active_browser_sessions: dict[str, dict] = {}
-
-# Concurrency Limiter: At most 4 headless browsers active simultaneously (backed by expanded 4GB virtual swap memory)
-browser_semaphore = asyncio.Semaphore(4)
 
 def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
     """Dispatches remote user click coordinates to the corresponding headless browser session."""
@@ -124,7 +122,12 @@ class DIUHeadlessScraper:
 
         yield {"type": "status", "message": "Connecting to DIU Student Portal..."}
 
-        await browser_semaphore.acquire()
+        try:
+            queue_id = await queue_manager.acquire(clean_id)
+        except QueueCancelledException:
+            yield {"type": "error", "message": "Scrape request was cancelled by administrator."}
+            return
+
         try:
             # Step 1: Headless login with Camoufox (persistent profile + engine-level anti-detect + English locale)
             async with AsyncCamoufox(
@@ -282,7 +285,7 @@ class DIUHeadlessScraper:
                     return
         finally:
             active_browser_sessions.pop(session_id, None)
-            browser_semaphore.release()
+            await queue_manager.release(queue_id)
 
         if not auth_code:
             yield {"type": "error", "message": "Invalid Student ID or Password. Please try again."}

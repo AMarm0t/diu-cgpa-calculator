@@ -25,7 +25,12 @@ import {
   Power,
   Play,
   Save,
-  ShieldAlert
+  ShieldAlert,
+  ListOrdered,
+  RefreshCw,
+  UserX,
+  AlertTriangle,
+  Activity
 } from "lucide-react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://direct-occupational-com-fellowship.trycloudflare.com";
@@ -86,6 +91,22 @@ interface StudentDetailRecord {
   };
 }
 
+interface QueueItemRecord {
+  queue_id: string;
+  student_id: string;
+  status: "waiting" | "running";
+  queued_at: string;
+  started_at?: string | null;
+}
+
+interface QueueStatusRecord {
+  limit: number;
+  active_count: number;
+  waiting_count: number;
+  running: QueueItemRecord[];
+  waiting: QueueItemRecord[];
+}
+
 export default function AdminPage() {
   const { data: session, status } = useSession();
   const [token, setToken] = useState<string>("");
@@ -108,7 +129,13 @@ export default function AdminPage() {
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
 
   // Active Navigation Tab
-  const [activeTab, setActiveTab] = useState<"database" | "settings" | "scrape">("database");
+  const [activeTab, setActiveTab] = useState<"database" | "settings" | "scrape" | "queue">("database");
+
+  // Queue Manager State
+  const [queueData, setQueueData] = useState<QueueStatusRecord | null>(null);
+  const [isLoadingQueue, setIsLoadingQueue] = useState<boolean>(false);
+  const [isActionQueueLoading, setIsActionQueueLoading] = useState<boolean>(false);
+  const [showClearConfirm, setShowClearConfirm] = useState<boolean>(false);
 
   // System Settings State
   const [cacheTtlMinutes, setCacheTtlMinutes] = useState<number>(60);
@@ -233,6 +260,75 @@ export default function AdminPage() {
       showToast("Error connecting to server.", "error");
     } finally {
       setIsSavingSettings(false);
+    }
+  };
+
+  // Fetch Scraper Queue Status
+  const fetchQueue = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/queue`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setQueueData(data.queue);
+      }
+    } catch (err) {
+      console.error("Failed to load queue:", err);
+    }
+  }, [token]);
+
+  // Remove individual student from queue
+  const handleRemoveFromQueue = async (id: string) => {
+    if (!token || isActionQueueLoading) return;
+    setIsActionQueueLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/queue/remove`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ id })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast(data.message || `Removed ${id} from queue.`, "success");
+        fetchQueue();
+      } else {
+        showToast(data.detail || "Failed to remove item from queue.", "error");
+      }
+    } catch {
+      showToast("Error connecting to server.", "error");
+    } finally {
+      setIsActionQueueLoading(false);
+    }
+  };
+
+  // Clear all waiting requests from queue
+  const handleClearQueue = async () => {
+    if (!token || isActionQueueLoading) return;
+    setIsActionQueueLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/queue/clear`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast(data.message || "Queue cleared successfully.", "success");
+        setShowClearConfirm(false);
+        fetchQueue();
+      } else {
+        showToast(data.detail || "Failed to clear queue.", "error");
+      }
+    } catch {
+      showToast("Error connecting to server.", "error");
+    } finally {
+      setIsActionQueueLoading(false);
     }
   };
 
@@ -361,8 +457,18 @@ export default function AdminPage() {
     if (token) {
       fetchStudents();
       fetchSettings();
+      fetchQueue();
     }
-  }, [token, fetchStudents, fetchSettings]);
+  }, [token, fetchStudents, fetchSettings, fetchQueue]);
+
+  // Live polling for queue when on queue tab
+  useEffect(() => {
+    if (activeTab === "queue" && token) {
+      fetchQueue();
+      const interval = setInterval(fetchQueue, 3000);
+      return () => clearInterval(interval);
+    }
+  }, [activeTab, token, fetchQueue]);
 
   const handleGoogleSignIn = () => {
     setAuthError("");
@@ -617,6 +723,24 @@ export default function AdminPage() {
                 >
                   <Play className="w-3.5 h-3.5 text-[#3ecf8e]" />
                   <span>Direct Scrape Tool</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("queue")}
+                  className={`px-3.5 py-2 text-xs font-mono font-medium flex items-center space-x-2 border-b-2 transition-all cursor-pointer ${
+                    activeTab === "queue"
+                      ? "border-[#3ecf8e] text-white bg-[#1c1c1c]/50 rounded-t-md"
+                      : "border-transparent text-[#777777] hover:text-[#cccccc]"
+                  }`}
+                >
+                  <ListOrdered className="w-3.5 h-3.5 text-[#3ecf8e]" />
+                  <span>Queue Manager</span>
+                  {queueData && (queueData.waiting_count > 0 || queueData.active_count > 0) && (
+                    <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/30 font-mono">
+                      {queueData.active_count + queueData.waiting_count}
+                    </span>
+                  )}
                 </button>
               </div>
 
@@ -976,6 +1100,220 @@ export default function AdminPage() {
                 </div>
               </div>
             )}
+
+            {/* Scraper Queue Manager Tab */}
+            {activeTab === "queue" && (
+              <div className="space-y-6">
+                {/* Header & Controls */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-[#161616] border border-[#242424] p-5 rounded-xl">
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <ListOrdered className="w-4 h-4 text-[#3ecf8e]" />
+                      Scraper Concurrency & Queue Manager
+                    </h3>
+                    <p className="text-xs text-[#777777] mt-1 leading-relaxed">
+                      Monitor active headless browser workers, inspect students waiting in line, or cancel/clear requests.
+                    </p>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <button
+                      type="button"
+                      onClick={() => fetchQueue()}
+                      disabled={isLoadingQueue || isActionQueueLoading}
+                      className="px-3 py-1.5 bg-[#1b1b1b] hover:bg-[#222222] border border-[#2e2e2e] text-[#cccccc] hover:text-white rounded-lg text-xs font-mono flex items-center space-x-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isLoadingQueue ? "animate-spin text-[#3ecf8e]" : ""}`} />
+                      <span>Refresh</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowClearConfirm(true)}
+                      disabled={!queueData || queueData.waiting_count === 0 || isActionQueueLoading}
+                      className="px-3 py-1.5 bg-red-950/40 hover:bg-red-900/60 border border-red-500/30 text-red-300 rounded-lg text-xs font-mono flex items-center space-x-1.5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Clear Queue ({queueData?.waiting_count || 0})</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Queue Summary Cards */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="bg-[#161616] border border-[#242424] p-4 rounded-lg">
+                    <div className="text-[11px] text-[#888888] uppercase font-mono tracking-wider mb-1 flex items-center justify-between">
+                      <span>Active Browser Workers</span>
+                      <Activity className="w-3.5 h-3.5 text-[#3ecf8e]" />
+                    </div>
+                    <div className="flex items-baseline space-x-2">
+                      <span className="text-2xl font-bold font-mono text-white">
+                        {queueData?.active_count || 0}
+                      </span>
+                      <span className="text-xs font-mono text-[#666666]">
+                        / {queueData?.limit || 4} slots
+                      </span>
+                    </div>
+                    {/* Visual worker slots */}
+                    <div className="flex items-center space-x-1.5 mt-3">
+                      {Array.from({ length: queueData?.limit || 4 }).map((_, i) => (
+                        <div
+                          key={i}
+                          className={`h-2 flex-1 rounded-sm transition-all ${
+                            i < (queueData?.active_count || 0)
+                              ? "bg-[#3ecf8e] shadow-[0_0_8px_rgba(62,207,142,0.4)]"
+                              : "bg-[#252525]"
+                          }`}
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="bg-[#161616] border border-[#242424] p-4 rounded-lg">
+                    <div className="text-[11px] text-[#888888] uppercase font-mono tracking-wider mb-1 flex items-center justify-between">
+                      <span>Waiting in Queue</span>
+                      <Clock className="w-3.5 h-3.5 text-amber-400" />
+                    </div>
+                    <div className="text-2xl font-bold font-mono text-amber-400">
+                      {queueData?.waiting_count || 0}
+                    </div>
+                    <p className="text-[11px] text-[#666666] font-mono mt-2">
+                      {(queueData?.waiting_count || 0) === 0
+                        ? "Queue clear — all searches process immediately"
+                        : `${queueData?.waiting_count} student(s) waiting in queue`}
+                    </p>
+                  </div>
+
+                  <div className="bg-[#161616] border border-[#242424] p-4 rounded-lg">
+                    <div className="text-[11px] text-[#888888] uppercase font-mono tracking-wider mb-1 flex items-center justify-between">
+                      <span>Concurrency Limit</span>
+                      <ShieldCheck className="w-3.5 h-3.5 text-[#3ecf8e]" />
+                    </div>
+                    <div className="text-2xl font-bold font-mono text-[#3ecf8e]">
+                      {queueData?.limit || 4} Max
+                    </div>
+                    <p className="text-[11px] text-[#666666] font-mono mt-2">
+                      Backed by 4GB SSD virtual swap memory
+                    </p>
+                  </div>
+                </div>
+
+                {/* Section 1: Active Running Scrapers */}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-mono font-semibold text-[#888888] uppercase tracking-wider flex items-center gap-2">
+                      <span className="w-2 h-2 rounded-full bg-[#3ecf8e] animate-pulse" />
+                      Active Scraping Tasks ({queueData?.running?.length || 0})
+                    </h4>
+                  </div>
+
+                  {queueData?.running && queueData.running.length > 0 ? (
+                    <div className="bg-[#161616] border border-[#242424] rounded-lg overflow-hidden">
+                      <table className="w-full text-left text-xs font-mono">
+                        <thead className="bg-[#1b1b1b] border-b border-[#242424] text-[10px] text-[#888888] uppercase">
+                          <tr>
+                            <th className="px-4 py-2.5">Student ID</th>
+                            <th className="px-4 py-2.5">Status</th>
+                            <th className="px-4 py-2.5">Started At</th>
+                            <th className="px-4 py-2.5 text-right">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#222222]">
+                          {queueData.running.map((item) => (
+                            <tr key={item.queue_id} className="hover:bg-[#1a1a1a]">
+                              <td className="px-4 py-3 font-semibold text-white">
+                                {item.student_id}
+                              </td>
+                              <td className="px-4 py-3">
+                                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-mono bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/30">
+                                  <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                                  Running
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 text-[#888888]">
+                                {item.started_at ? new Date(item.started_at).toLocaleTimeString() : "-"}
+                              </td>
+                              <td className="px-4 py-3 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveFromQueue(item.queue_id)}
+                                  disabled={isActionQueueLoading}
+                                  className="px-2.5 py-1 rounded bg-red-950/40 hover:bg-red-900/60 border border-red-500/30 text-red-300 hover:text-red-200 text-xs transition-colors cursor-pointer disabled:opacity-50"
+                                >
+                                  Cancel Scrape
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="bg-[#161616] border border-[#242424] rounded-lg p-6 text-center text-xs text-[#666666] font-mono">
+                      No active scrapers currently executing. Browser workers are idle.
+                    </div>
+                  )}
+                </div>
+
+                {/* Section 2: Waiting Queue */}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-mono font-semibold text-[#888888] uppercase tracking-wider flex items-center gap-2">
+                      <Clock className="w-3.5 h-3.5 text-amber-400" />
+                      Waiting Queue ({queueData?.waiting?.length || 0})
+                    </h4>
+                  </div>
+
+                  {queueData?.waiting && queueData.waiting.length > 0 ? (
+                    <div className="bg-[#161616] border border-[#242424] rounded-lg overflow-hidden">
+                      <table className="w-full text-left text-xs font-mono">
+                        <thead className="bg-[#1b1b1b] border-b border-[#242424] text-[10px] text-[#888888] uppercase">
+                          <tr>
+                            <th className="px-4 py-2.5">Position</th>
+                            <th className="px-4 py-2.5">Student ID</th>
+                            <th className="px-4 py-2.5">Status</th>
+                            <th className="px-4 py-2.5">Queued At</th>
+                            <th className="px-4 py-2.5 text-right">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#222222]">
+                          {queueData.waiting.map((item, index) => (
+                            <tr key={item.queue_id} className="hover:bg-[#1a1a1a]">
+                              <td className="px-4 py-3 text-amber-400 font-bold">
+                                #{index + 1}
+                              </td>
+                              <td className="px-4 py-3 font-semibold text-white">
+                                {item.student_id}
+                              </td>
+                              <td className="px-4 py-3">
+                                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-mono bg-amber-950/30 text-amber-400 border border-amber-500/30">
+                                  Waiting in Line
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 text-[#888888]">
+                                {item.queued_at ? new Date(item.queued_at).toLocaleTimeString() : "-"}
+                              </td>
+                              <td className="px-4 py-3 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveFromQueue(item.queue_id)}
+                                  disabled={isActionQueueLoading}
+                                  className="px-2.5 py-1 rounded bg-red-950/40 hover:bg-red-900/60 border border-red-500/30 text-red-300 hover:text-red-200 text-xs transition-colors cursor-pointer disabled:opacity-50"
+                                >
+                                  Remove
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="bg-[#161616] border border-[#242424] rounded-lg p-6 text-center text-xs text-[#666666] font-mono">
+                      Queue is currently empty. Incoming searches start immediately.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         )}
         </div>
@@ -1042,6 +1380,42 @@ export default function AdminPage() {
                   className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-white text-xs font-semibold transition-colors"
                 >
                   Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Clear Queue Confirmation Modal */}
+        {showClearConfirm && (
+          <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-[#161616] border border-[#2b2b2b] rounded-lg max-w-sm w-full p-5 shadow-2xl text-left space-y-4">
+              <div className="flex items-center space-x-3">
+                <div className="p-2 rounded-md bg-red-950/50 border border-red-500/30 text-red-400">
+                  <AlertTriangle className="w-4 h-4" />
+                </div>
+                <h3 className="text-sm font-semibold text-white">Clear Scraper Queue</h3>
+              </div>
+              <p className="text-xs text-[#999999] leading-relaxed">
+                Are you sure you want to cancel and clear all <span className="text-white font-mono font-bold">{queueData?.waiting_count || 0}</span> waiting student requests from the queue?
+              </p>
+              <div className="flex items-center space-x-2 pt-2 justify-end">
+                <button
+                  type="button"
+                  onClick={() => setShowClearConfirm(false)}
+                  disabled={isActionQueueLoading}
+                  className="px-3 py-1.5 rounded-md bg-[#222222] hover:bg-[#2a2a2a] text-[#cccccc] text-xs font-medium transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleClearQueue}
+                  disabled={isActionQueueLoading}
+                  className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-white text-xs font-semibold transition-colors flex items-center space-x-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {isActionQueueLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                  <span>Clear All Waiting</span>
                 </button>
               </div>
             </div>

@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import db
 from auth import verify_google_admin
-
+from queue_manager import queue_manager
 from scraper import DIUHeadlessScraper, dispatch_remote_click
 from cgpa_calculator import calculate_overall_cgpa
 
@@ -279,6 +279,28 @@ async def admin_direct_scrape(req: ScrapeRequest, admin: dict = Depends(get_curr
     scraper = DIUHeadlessScraper()
     result = await scraper.scrape(student_id=req.student_id.strip(), password=req.password.strip())
     return result
+
+class QueueRemoveRequest(BaseModel):
+    id: str
+
+@app.get("/api/admin/queue")
+async def admin_get_queue(admin: dict = Depends(get_current_admin)):
+    """Returns current live queue status, running scrapers, and waiting requests."""
+    return {"status": "ok", "queue": queue_manager.get_status()}
+
+@app.post("/api/admin/queue/remove")
+async def admin_remove_queue(req: QueueRemoveRequest, admin: dict = Depends(get_current_admin)):
+    """Removes and cancels a specific student ID or queue_id from the queue."""
+    found = await queue_manager.remove(req.id)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Item '{req.id}' not found in active or waiting queue.")
+    return {"status": "ok", "message": f"Successfully removed {req.id} from queue."}
+
+@app.post("/api/admin/queue/clear")
+async def admin_clear_queue(admin: dict = Depends(get_current_admin)):
+    """Cancels and purges all waiting requests from the queue."""
+    cancelled_count = await queue_manager.clear()
+    return {"status": "ok", "message": f"Cleared {cancelled_count} waiting requests from queue.", "cancelled_count": cancelled_count}
 
 
 if __name__ == "__main__":
