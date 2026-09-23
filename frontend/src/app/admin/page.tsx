@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
-import Script from "next/script";
+import React, { useState, useEffect, useCallback } from "react";
+import { signIn, signOut, useSession } from "next-auth/react";
 import Link from "next/link";
 import { 
   ShieldCheck, 
@@ -24,13 +24,6 @@ import {
 } from "lucide-react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://direct-occupational-com-fellowship.trycloudflare.com";
-const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
-
-declare global {
-  interface Window {
-    google?: any;
-  }
-}
 
 interface AdminProfile {
   name: string;
@@ -89,6 +82,7 @@ interface StudentDetailRecord {
 }
 
 export default function AdminPage() {
+  const { data: session, status } = useSession();
   const [token, setToken] = useState<string>("");
   const [admin, setAdmin] = useState<AdminProfile | null>(null);
   const [authError, setAuthError] = useState<string>("");
@@ -113,6 +107,7 @@ export default function AdminPage() {
     setTimeout(() => setToastMessage(null), 4000);
   };
 
+  // When NextAuth session is available, verify with our backend
   const verifyAndSetToken = useCallback(async (authToken: string) => {
     setIsLoadingAuth(true);
     setAuthError("");
@@ -127,24 +122,24 @@ export default function AdminPage() {
       const data = await res.json();
       setToken(authToken);
       setAdmin(data.admin);
-      sessionStorage.setItem("diu_admin_token", authToken);
     } catch (err: any) {
       setAuthError(err.message || "Authentication failed.");
       setAdmin(null);
       setToken("");
-      sessionStorage.removeItem("diu_admin_token");
     } finally {
       setIsLoadingAuth(false);
     }
   }, []);
 
-  // Check saved session
+  // When NextAuth session loads with an access token, verify it with backend
   useEffect(() => {
-    const savedToken = sessionStorage.getItem("diu_admin_token");
-    if (savedToken) {
-      verifyAndSetToken(savedToken);
+    if (status === "authenticated" && session) {
+      const authToken = (session as any).accessToken || (session as any).idToken;
+      if (authToken && !token) {
+        verifyAndSetToken(authToken);
+      }
     }
-  }, [verifyAndSetToken]);
+  }, [session, status, token, verifyAndSetToken]);
 
   // Fetch students list
   const fetchStudents = useCallback(async () => {
@@ -171,72 +166,15 @@ export default function AdminPage() {
     }
   }, [token, fetchStudents]);
 
-  // Handle Google Callback
-  const tokenClientRef = useRef<any>(null);
-
-  // Initialize Google OAuth2 Token Client
-  const initGoogleAuth = useCallback(() => {
-    if (typeof window !== "undefined" && window.google?.accounts?.oauth2 && GOOGLE_CLIENT_ID) {
-      try {
-        tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
-          client_id: GOOGLE_CLIENT_ID,
-          scope: "openid email profile",
-          callback: (response: any) => {
-            if (response?.access_token) {
-              verifyAndSetToken(response.access_token);
-            } else if (response?.error) {
-              setAuthError(`Google Sign-In error: ${response.error_description || response.error}`);
-            }
-          },
-        });
-      } catch (e) {
-        console.error("Error initializing Google Identity Services:", e);
-      }
-    }
-  }, [verifyAndSetToken]);
-
-  useEffect(() => {
-    initGoogleAuth();
-  }, [initGoogleAuth]);
-
   const handleGoogleSignIn = () => {
     setAuthError("");
-    if (typeof window !== "undefined" && window.google?.accounts?.oauth2 && GOOGLE_CLIENT_ID) {
-      try {
-        // Initialize fresh client directly inside click event
-        // with error_callback to guarantee repeated clicks work in Edge & Chromium
-        const client = window.google.accounts.oauth2.initTokenClient({
-          client_id: GOOGLE_CLIENT_ID,
-          scope: "openid email profile",
-          callback: (response: any) => {
-            if (response?.access_token) {
-              verifyAndSetToken(response.access_token);
-            } else if (response?.error) {
-              setAuthError(`Google Sign-In error: ${response.error_description || response.error}`);
-            }
-          },
-          error_callback: (err: any) => {
-            console.warn("Google OAuth popup error or closed:", err);
-            setIsLoadingAuth(false);
-          },
-        });
-        tokenClientRef.current = client;
-        client.requestAccessToken({ prompt: "select_account" });
-      } catch (e: any) {
-        setAuthError(`Failed to launch Google Sign-In: ${e?.message || e}`);
-      }
-    } else {
-      setAuthError("Google Identity service is loading. Please try again in a moment.");
-    }
+    signIn("google", { callbackUrl: "/admin" });
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     setToken("");
     setAdmin(null);
-    sessionStorage.removeItem("diu_admin_token");
-    if (typeof window !== "undefined" && window.google?.accounts?.id) {
-      window.google.accounts.id.disableAutoSelect();
-    }
+    await signOut({ callbackUrl: "/admin" });
   };
 
   // Inspect student detail
@@ -319,14 +257,12 @@ export default function AdminPage() {
     ? Math.max(...students.map(s => s.overall_cgpa || 0)).toFixed(2)
     : "0.00";
 
+  // Show loading while NextAuth session is being fetched
+  const isSessionLoading = status === "loading";
+  const isAuthenticated = !!admin && !!token;
+
   return (
     <>
-      <Script 
-        src="https://accounts.google.com/gsi/client" 
-        strategy="afterInteractive" 
-        onLoad={initGoogleAuth}
-      />
-
       {/* Supabase Dark Studio Background */}
       <main className="min-h-screen bg-[#0f0f0f] text-[#ededed] flex flex-col font-sans selection:bg-[#3ecf8e]/30 selection:text-[#3ecf8e]">
         {/* Toast */}
@@ -362,7 +298,7 @@ export default function AdminPage() {
               </div>
             </div>
 
-            {admin && (
+            {isAuthenticated && (
               <div className="flex items-center space-x-3">
                 <div className="flex items-center space-x-2 bg-[#1a1a1a] border border-[#2b2b2b] px-2.5 py-1 rounded-md">
                   {admin.picture ? (
@@ -388,7 +324,7 @@ export default function AdminPage() {
 
         {/* Content Area */}
         <div className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8">
-          {!admin ? (
+          {!isAuthenticated ? (
             /* Supabase Dark Login Card */
             <div className="max-w-sm mx-auto mt-20 bg-[#161616] border border-[#262626] rounded-xl p-8 shadow-2xl text-center">
               <div className="w-10 h-10 rounded-lg bg-[#3ecf8e]/10 border border-[#3ecf8e]/20 flex items-center justify-center mx-auto mb-4 text-[#3ecf8e]">
@@ -403,7 +339,7 @@ export default function AdminPage() {
                 </div>
               )}
 
-              {isLoadingAuth ? (
+              {isLoadingAuth || isSessionLoading ? (
                 <div className="py-6 flex flex-col items-center justify-center space-y-2 text-[#888888] text-xs">
                   <Loader2 className="w-5 h-5 animate-spin text-[#3ecf8e]" />
                   <span>Verifying admin privileges...</span>
