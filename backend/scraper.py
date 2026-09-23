@@ -154,13 +154,6 @@ class DIUHeadlessScraper:
                 page.on("framenavigated", lambda frame: check_url(frame.url))
 
                 try:
-                    # Pre-warm: visit the main portal domain first to seed cookies and storage
-                    try:
-                        await page.goto("https://studentportal.diu.edu.bd/", timeout=15000, wait_until="domcontentloaded")
-                        await page.wait_for_timeout(1000)
-                    except Exception:
-                        pass
-
                     yield {"type": "status", "message": "Passing security verification..."}
                     await page.goto(LOGIN_URL, timeout=35000, wait_until="domcontentloaded")
 
@@ -170,9 +163,9 @@ class DIUHeadlessScraper:
                         if auth_code:
                             break
 
-                        await page.wait_for_timeout(1000)
+                        await page.wait_for_timeout(400)
 
-                        # Check if Turnstile widget is present on current page (target widget directly, not outer wrapper)
+                        # Check if Turnstile widget is present on current page
                         widget = page.locator('#kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]').first
                         has_turnstile = await widget.count() > 0
 
@@ -183,9 +176,9 @@ class DIUHeadlessScraper:
 
                         # If Turnstile is active and not yet solved:
                         if has_turnstile and not token_val:
-                            # Allow Camoufox 5-6s to auto-solve silently (frequent on clean/persistent profiles)
-                            for _ in range(5):
-                                await page.wait_for_timeout(1000)
+                            # Quick 1s check to see if Camoufox passes silently
+                            for _ in range(2):
+                                await page.wait_for_timeout(500)
                                 token_val = await page.evaluate("""() => {
                                     const el = document.querySelector('[name="cf-turnstile-response"]');
                                     return el && el.value ? el.value : null;
@@ -193,25 +186,22 @@ class DIUHeadlessScraper:
                                 if token_val:
                                     break
 
-                            # If still not solved (e.g. VPN or strict IP challenge), relay to user
+                            # If still not solved (interactive checkbox challenge), prompt user immediately
                             if not token_val:
                                 try:
-                                    # Ensure widget has rendered with proper dimensions and contents
-                                    for _ in range(12):
+                                    # Ensure widget has rendered dimensions
+                                    for _ in range(8):
                                         box = await widget.bounding_box()
-                                        if box and box["width"] >= 250 and box["height"] >= 50:
+                                        if box and box["width"] >= 200 and box["height"] >= 40:
                                             break
-                                        await page.wait_for_timeout(300)
+                                        await page.wait_for_timeout(150)
 
-                                    # Allow paint time for the square checkbox graphic
-                                    await page.wait_for_timeout(1000)
                                     box = await widget.bounding_box()
                                     if box and box["width"] > 0 and box["height"] > 0:
                                         active_browser_sessions[session_id]["box"] = box
                                         img_bytes = await widget.screenshot()
                                         img_b64 = "data:image/png;base64," + base64.b64encode(img_bytes).decode('utf-8')
 
-                                        # CRITICAL: Clear old event state and old coords before prompting!
                                         session_event.clear()
                                         active_browser_sessions[session_id]["click_coords"] = None
 
@@ -229,21 +219,20 @@ class DIUHeadlessScraper:
                                             if coords:
                                                 click_x = float(coords["x"])
                                                 click_y = float(coords["y"])
-                                                await page.mouse.move(click_x, click_y, steps=8)
+                                                await page.mouse.move(click_x, click_y, steps=6)
                                                 await page.mouse.click(click_x, click_y)
                                                 yield {"type": "status", "message": "Verification received. Processing..."}
                                                 
-                                                # Poll for token resolution
-                                                for _ in range(8):
-                                                    await page.wait_for_timeout(1000)
+                                                # Fast poll for token resolution (every 400ms)
+                                                for _ in range(15):
+                                                    await page.wait_for_timeout(400)
                                                     token_val = await page.evaluate("""() => {
                                                         const el = document.querySelector('[name="cf-turnstile-response"]');
                                                         return el && el.value ? el.value : null;
                                                     }""")
                                                     if token_val:
+                                                        yield {"type": "challenge_solved"}
                                                         break
-
-                                                yield {"type": "challenge_solved"}
                                         except asyncio.TimeoutError:
                                             yield {"type": "error", "message": "Verification timed out. Please try again."}
                                             return
@@ -254,11 +243,10 @@ class DIUHeadlessScraper:
                         continue_btn = page.locator('#kc-turnstile-submit, input[type="submit"][name="continue"]').first
                         if await continue_btn.count() > 0 and token_val:
                             try:
-                                # Use no_wait_after=True to prevent 30s navigation freeze
                                 await continue_btn.click(no_wait_after=True, timeout=5000)
                             except Exception:
                                 await page.evaluate("() => { const f = document.querySelector('#kc-turnstile-form'); if (f) f.submit(); }")
-                            await page.wait_for_timeout(2000)
+                            await page.wait_for_timeout(1000)
                             continue
 
                         # Check for Keycloak login error message (e.g. wrong password)
