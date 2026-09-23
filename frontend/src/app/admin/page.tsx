@@ -182,19 +182,28 @@ export default function AdminPage() {
   const initGoogleAuth = useCallback(() => {
     if (typeof window !== "undefined" && window.google?.accounts?.id && GOOGLE_CLIENT_ID) {
       try {
+        // Prevent auto-selection of active browser session
+        window.google.accounts.id.disableAutoSelect();
+
         window.google.accounts.id.initialize({
           client_id: GOOGLE_CLIENT_ID,
           callback: handleGoogleCallback,
           auto_select: false,
+          cancel_on_tap_outside: true,
+          context: "signin",
         });
+
         const container = document.getElementById("google-signin-btn");
         if (container) {
+          container.innerHTML = "";
           window.google.accounts.id.renderButton(container, {
+            type: "standard",
             theme: "filled_black",
             size: "large",
-            width: 280,
-            text: "continue_with",
+            width: 300,
+            text: "signin_with",
             shape: "rectangular",
+            logo_alignment: "left",
           });
         }
       } catch (e) {
@@ -211,6 +220,9 @@ export default function AdminPage() {
     setToken("");
     setAdmin(null);
     sessionStorage.removeItem("diu_admin_token");
+    if (typeof window !== "undefined" && window.google?.accounts?.id) {
+      window.google.accounts.id.disableAutoSelect();
+    }
   };
 
   // Inspect student detail
@@ -383,9 +395,23 @@ export default function AdminPage() {
                   <span>Authenticating...</span>
                 </div>
               ) : (
-                <div className="flex flex-col items-center justify-center">
+                <div className="flex flex-col items-center justify-center space-y-3">
                   {/* Google Identity Services Container */}
                   <div id="google-signin-btn" className="flex justify-center min-h-[44px]"></div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (typeof window !== "undefined" && window.google?.accounts?.id) {
+                        window.google.accounts.id.disableAutoSelect();
+                        initGoogleAuth();
+                        window.google.accounts.id.prompt();
+                      }
+                    }}
+                    className="text-[11px] text-[#777777] hover:text-[#3ecf8e] transition-colors underline cursor-pointer pt-1"
+                  >
+                    Switch or choose different Google account
+                  </button>
                 </div>
               )}
             </div>
