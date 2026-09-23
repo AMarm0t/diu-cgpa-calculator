@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { 
   ChevronDown, 
   ChevronUp, 
@@ -113,12 +113,18 @@ export default function Home() {
   
   const [challengeData, setChallengeData] = useState<ChallengeData | null>(null);
   const [isClicking, setIsClicking] = useState(false);
+  const clickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const [data, setData] = useState<StudentData | null>(null);
 
   const handleChallengeClick = async (e: React.MouseEvent<HTMLImageElement>) => {
     if (!challengeData || isClicking) return;
     setIsClicking(true);
+
+    if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+    clickTimeoutRef.current = setTimeout(() => {
+      setIsClicking(false);
+    }, 8000);
 
     const rect = e.currentTarget.getBoundingClientRect();
     const scaleX = (challengeData.box.width || rect.width) / rect.width;
@@ -127,15 +133,13 @@ export default function Home() {
     const relX = (e.clientX - rect.left) * scaleX;
     const relY = (e.clientY - rect.top) * scaleY;
 
-    // Standard Cloudflare Turnstile checkbox is located at ~(x: 28, y: 32)
-    // If the user clicked anywhere inside the interactive left/center area,
-    // smart-target the checkbox center directly for 100% reliable trigger:
+    // Standard Cloudflare Turnstile checkbox center inside widget (x: 21, y: 33)
     let clickX = (challengeData.box.x || 0) + relX;
     let clickY = (challengeData.box.y || 0) + relY;
 
     if (relX < 210 && relY < 70) {
-      clickX = (challengeData.box.x || 0) + 28;
-      clickY = (challengeData.box.y || 0) + 32;
+      clickX = (challengeData.box.x || 0) + 21;
+      clickY = (challengeData.box.y || 0) + 33;
     }
 
     try {
@@ -150,6 +154,7 @@ export default function Home() {
       });
     } catch (err) {
       console.error("Failed to forward captcha click:", err);
+      if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
       setIsClicking(false);
     }
   };
@@ -196,13 +201,19 @@ export default function Home() {
             if (payload.type === "status") {
               setLoadingMsg(payload.message);
             } else if (payload.type === "challenge_required") {
+              if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
               setChallengeData({
                 sessionId: payload.session_id,
                 image: payload.image,
                 box: payload.box || { x: 0, y: 0, width: 300, height: 65 }
               });
               setIsClicking(false);
+            } else if (payload.type === "challenge_retry") {
+              if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+              setIsClicking(false);
+              setLoadingMsg(payload.message || "Please click the checkbox again.");
             } else if (payload.type === "challenge_solved") {
+              if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
               setChallengeData(null);
               setIsClicking(false);
             } else if (payload.type === "error") {
@@ -252,9 +263,11 @@ export default function Home() {
       setError(err.message || "An unexpected error occurred.");
       setData(null);
     } finally {
+      if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
       setIsLoading(false);
       setIsStreaming(false);
       setChallengeData(null);
+      setIsClicking(false);
     }
   };
 
@@ -353,7 +366,7 @@ export default function Home() {
                         ? "bg-[#101010] border-[#2b2b2b] text-white font-mono placeholder-[#555555] focus:border-[#3ecf8e] focus:ring-1 focus:ring-[#3ecf8e]"
                         : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
                     }`}
-                    placeholder="e.g. xxx-xx-xxx"
+                    placeholder="xxx-xx-xxx"
                     value={studentId}
                     onChange={(e) => setStudentId(e.target.value)}
                   />
@@ -407,16 +420,6 @@ export default function Home() {
                   )}
                 </button>
               </form>
-
-              <div className="mt-8 text-center space-y-4">
-                <p className={`text-xs p-4 rounded-lg leading-relaxed ${
-                  isDark
-                    ? "bg-[#101010] border border-[#222222] text-[#888888] font-mono"
-                    : "bg-slate-50 text-slate-500"
-                }`}>
-                  <strong className={isDark ? "text-[#cccccc]" : "text-slate-700"}>Security Notice:</strong> Your credentials are sent securely to the DIU student portal backend for verification. They are never saved or stored.
-                </p>
-              </div>
             </div>
           </div>
         </main>

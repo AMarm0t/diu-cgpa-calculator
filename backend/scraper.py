@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import uuid
+import sys
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 import httpx
@@ -120,6 +121,15 @@ class DIUHeadlessScraper:
         profile_dir = os.path.abspath(f"./browser_profiles/user_{student_id.replace('-', '_')}")
         os.makedirs(profile_dir, exist_ok=True)
 
+        # Proactively remove stale lock files left by previous aborted/crashed sessions
+        for lock_name in [".parentlock", "lock", "parent.lock"]:
+            lp = os.path.join(profile_dir, lock_name)
+            try:
+                if os.path.islink(lp) or os.path.exists(lp):
+                    os.remove(lp)
+            except Exception:
+                pass
+
         yield {"type": "status", "message": "Connecting to DIU Student Portal..."}
 
         try:
@@ -130,8 +140,10 @@ class DIUHeadlessScraper:
 
         try:
             # Step 1: Headless login with Camoufox (persistent profile + engine-level anti-detect + English locale)
+            # Use 'virtual' display (Xvfb) on Linux for real window compositor and reliable Turnstile resolution
+            headless_mode = "virtual" if sys.platform.startswith("linux") else True
             async with AsyncCamoufox(
-                headless=True,
+                headless=headless_mode,
                 humanize=True,
                 disable_coop=True,
                 i_know_what_im_doing=True,
@@ -179,8 +191,8 @@ class DIUHeadlessScraper:
 
                         # If Turnstile is active and not yet solved:
                         if has_turnstile and not token_val:
-                            # Quick 1s check to see if Camoufox passes silently
-                            for _ in range(2):
+                            # Allow Camoufox 3-4s to pass Turnstile automatically in the background
+                            for _ in range(6):
                                 await page.wait_for_timeout(500)
                                 token_val = await page.evaluate("""() => {
                                     const el = document.querySelector('[name="cf-turnstile-response"]');
@@ -189,16 +201,18 @@ class DIUHeadlessScraper:
                                 if token_val:
                                     break
 
-                            # If still not solved (interactive checkbox challenge), prompt user immediately
+                            # If still not solved (interactive checkbox challenge), wait for widget to settle before screenshotting
                             if not token_val:
                                 try:
                                     # Ensure widget has rendered dimensions
-                                    for _ in range(8):
+                                    for _ in range(10):
                                         box = await widget.bounding_box()
                                         if box and box["width"] >= 200 and box["height"] >= 40:
                                             break
-                                        await page.wait_for_timeout(150)
+                                        await page.wait_for_timeout(200)
 
+                                    # Short delay to allow checkbox element to paint
+                                    await page.wait_for_timeout(1000)
                                     box = await widget.bounding_box()
                                     if box and box["width"] > 0 and box["height"] > 0:
                                         active_browser_sessions[session_id]["box"] = box
@@ -222,13 +236,13 @@ class DIUHeadlessScraper:
                                             if coords:
                                                 click_x = float(coords["x"])
                                                 click_y = float(coords["y"])
-                                                await page.mouse.move(click_x, click_y, steps=6)
+                                                await page.mouse.move(click_x, click_y, steps=8)
                                                 await page.mouse.click(click_x, click_y)
                                                 yield {"type": "status", "message": "Verification received. Processing..."}
                                                 
-                                                # Fast poll for token resolution (every 400ms)
-                                                for _ in range(15):
-                                                    await page.wait_for_timeout(400)
+                                                # Fast poll for token resolution (every 300ms, up to 10s)
+                                                for _ in range(30):
+                                                    await page.wait_for_timeout(300)
                                                     token_val = await page.evaluate("""() => {
                                                         const el = document.querySelector('[name="cf-turnstile-response"]');
                                                         return el && el.value ? el.value : null;
@@ -236,6 +250,9 @@ class DIUHeadlessScraper:
                                                     if token_val:
                                                         yield {"type": "challenge_solved"}
                                                         break
+
+                                                if not token_val:
+                                                    yield {"type": "challenge_retry", "message": "Verification still pending. Please click the checkbox again."}
                                         except asyncio.TimeoutError:
                                             yield {"type": "error", "message": "Verification timed out. Please try again."}
                                             return
@@ -285,6 +302,15 @@ class DIUHeadlessScraper:
                     return
         finally:
             active_browser_sessions.pop(session_id, None)
+            # Ensure lock files are cleaned up upon session termination
+            if profile_dir:
+                for lock_name in [".parentlock", "lock", "parent.lock"]:
+                    lp = os.path.join(profile_dir, lock_name)
+                    try:
+                        if os.path.islink(lp) or os.path.exists(lp):
+                            os.remove(lp)
+                    except Exception:
+                        pass
             await queue_manager.release(queue_id)
 
         if not auth_code:

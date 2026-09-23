@@ -1057,7 +1057,7 @@ export default function AdminPage() {
                       <label className="text-xs font-mono text-[#888888]">Student ID</label>
                       <input
                         type="text"
-                        placeholder="e.g. xxx-xx-xxx"
+                        placeholder="xxx-xx-xxx"
                         value={scrapeStudentId}
                         onChange={(e) => setScrapeStudentId(e.target.value)}
                         disabled={isScrapingAdmin}
