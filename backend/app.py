@@ -1,0 +1,224 @@
+"""
+DIU CGPA Calculator - FastAPI Backend
+Provides API endpoint for the frontend to trigger portal scraping.
+"""
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+# Add current directory to sys.path for local module imports
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from scraper import DIUHeadlessScraper, dispatch_remote_click
+from cgpa_calculator import calculate_overall_cgpa
+
+# Request/Response models
+class ScrapeRequest(BaseModel):
+    student_id: str
+    password: str
+
+class CaptchaClickRequest(BaseModel):
+    session_id: str
+    x: float
+    y: float
+
+class StudentInfo(BaseModel):
+    id: str = ""
+    name: str = ""
+    department: str = ""
+    campus: str = ""
+    email: str = ""
+
+class CourseResult(BaseModel):
+    name: str = ""
+    code: str = ""
+    credits: float = 0
+    grade: str = ""
+    grade_point: float = 0
+
+class SemesterResult(BaseModel):
+    name: str = ""
+    gpa: float = 0
+    credits: float = 0
+    courses: list[CourseResult] = []
+
+class ScrapeResponse(BaseModel):
+    success: bool
+    error: str = ""
+    student: StudentInfo | None = None
+    overall_cgpa: float = 0
+    total_credits: float = 0
+    total_completed_credits: float = 0
+    semesters: list[SemesterResult] = []
+
+# FastAPI app
+app = FastAPI(
+    title="DIU CGPA Calculator",
+    description="Headless Scraper & CGPA Calculator for DIU",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "DIU CGPA Calculator API (Headless)"}
+
+@app.post("/api/scrape", response_model=ScrapeResponse)
+async def scrape_results(request: ScrapeRequest):
+    if not request.student_id or not request.password:
+        raise HTTPException(status_code=400, detail="Student ID and password are required")
+    
+    scraper = DIUHeadlessScraper()
+    try:
+        result = await scraper.scrape(
+            student_id=request.student_id.strip(),
+            password=request.password.strip()
+        )
+        
+        if not result.get("success"):
+            return ScrapeResponse(
+                success=False,
+                error=result.get("error", "Login or scraping failed.")
+            )
+
+        return ScrapeResponse(
+            success=True,
+            student=StudentInfo(**result.get("student", {})),
+            overall_cgpa=result.get("overall_cgpa", 0.0),
+            total_credits=result.get("total_credits", 0.0),
+            total_completed_credits=result.get("total_completed_credits", 0.0),
+            semesters=result.get("semesters", [])
+        )
+    except Exception as e:
+        return ScrapeResponse(
+            success=False,
+            error=f"Error: {str(e)}"
+        )
+
+@app.post("/api/scrape-stream")
+async def scrape_stream_endpoint(request: ScrapeRequest):
+    if not request.student_id or not request.password:
+        raise HTTPException(status_code=400, detail="Student ID and password are required")
+    
+    scraper = DIUHeadlessScraper()
+    async def event_generator():
+        try:
+            async for item in scraper.scrape_stream(request.student_id.strip(), request.password.strip()):
+                yield f"data: {json.dumps(item)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+@app.post("/api/captcha-click")
+async def captcha_click_endpoint(req: CaptchaClickRequest):
+    success = dispatch_remote_click(req.session_id, req.x, req.y)
+    if not success:
+        raise HTTPException(status_code=404, detail="Active browser session not found or timed out.")
+    return {"status": "ok", "message": "Click dispatched to browser"}
+
+
+@app.post("/api/calculate-cgpa")
+async def calculate_cgpa_manual(data: dict):
+    """
+    Manually calculate CGPA from provided grade data.
+    For users who want to enter their grades manually.
+    """
+    semesters = data.get("semesters", [])
+    if not semesters:
+        raise HTTPException(status_code=400, detail="No semester data provided")
+    
+    result = calculate_overall_cgpa(semesters)
+    return result
+
+
+# ==========================================
+# ADMIN ENDPOINTS (Google Auth Protected)
+# ==========================================
+import db
+from auth import verify_google_admin
+from fastapi import Header, Depends
+
+@app.on_event("startup")
+async def on_startup():
+    db.init_db()
+
+async def get_current_admin(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
+    token = parts[1]
+    admin = await verify_google_admin(token)
+    if not admin:
+        raise HTTPException(status_code=403, detail="Access denied. Authorized Google admin account required.")
+    return admin
+
+@app.get("/api/admin/me")
+async def admin_me(admin: dict = Depends(get_current_admin)):
+    """Verifies that the caller's Google credentials are valid and authorized."""
+    return {"status": "ok", "admin": admin}
+
+@app.get("/api/admin/students")
+async def admin_list_students(admin: dict = Depends(get_current_admin)):
+    """Returns overview list of all students cached in database."""
+    students = db.list_all_students()
+    return {"status": "ok", "total": len(students), "students": students}
+
+@app.get("/api/admin/student/{student_id}")
+async def admin_get_student_detail(student_id: str, admin: dict = Depends(get_current_admin)):
+    """Returns full academic transcript for a specific student without needing their password."""
+    record = db.get_student(student_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Student record not found in database.")
+    # Strip sensitive password hash before returning
+    record.pop("password_hash", None)
+    return {"status": "ok", "record": record}
+
+@app.post("/api/admin/student/{student_id}/reset-cache")
+async def admin_reset_student_cache(student_id: str, admin: dict = Depends(get_current_admin)):
+    """Expires the 1-hour cache timer for a student, forcing fresh scrape on next login."""
+    success = db.reset_student_cache(student_id)
+    return {"status": "ok", "message": f"Cache expired for {student_id}. Next login will scrape portal live."}
+
+@app.delete("/api/admin/student/{student_id}")
+async def admin_delete_student(student_id: str, admin: dict = Depends(get_current_admin)):
+    """Permanently deletes student records and cached browser profile from database."""
+    db.delete_student(student_id)
+    return {"status": "ok", "message": f"Student {student_id} permanently removed from database."}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting DIU CGPA Calculator API...")
+    print("Open http://localhost:8000 in your browser")
+    print("Frontend should be running at http://localhost:3000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  diu-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: diu_cgpa_backend
+    restart: always
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Persistent storage for browser profiles & cf_clearance cookies
+      - ./browser_profiles:/app/browser_profiles
+      # Fallback database storage
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1

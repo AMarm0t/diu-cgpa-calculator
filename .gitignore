@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Browser persistent profiles
+browser_profiles/
+test_profile/
+chrome_profile/
+backend/.browser_profile/
+data/
+*.png
+
+# Next.js
+frontend/.next/
+frontend/node_modules/
+frontend/.env*.local
+node_modules/
+.DS_Store
+Thumbs.db

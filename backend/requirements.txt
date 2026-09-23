@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+playwright
+httpx
+python-dotenv
+beautifulsoup4
+pydantic
+supabase
+google-auth
