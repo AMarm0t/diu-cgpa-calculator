@@ -21,8 +21,8 @@ GATEWAY_BASE = "https://gateway7.diu.edu.bd/api/student/portal"
 # Registry for active interactive browser sessions
 active_browser_sessions: dict[str, dict] = {}
 
-# Concurrency Limiter: At most 2 headless browsers active simultaneously to protect VM RAM & CPU
-browser_semaphore = asyncio.Semaphore(2)
+# Concurrency Limiter: At most 4 headless browsers active simultaneously (backed by expanded 4GB virtual swap memory)
+browser_semaphore = asyncio.Semaphore(4)
 
 def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
     """Dispatches remote user click coordinates to the corresponding headless browser session."""
