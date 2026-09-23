@@ -13,9 +13,9 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 
 async def verify_google_admin(token: str) -> Optional[Dict[str, Any]]:
     """
-    Verifies a Google OAuth ID token.
+    Verifies a Google OAuth token (either ID token JWT or OAuth2 access_token).
     Checks that:
-    1. The token is valid and signed by Google.
+    1. The token is valid and signed/issued by Google.
     2. The email is verified.
     3. The email is included in the ADMIN_EMAILS whitelist.
     """
@@ -23,22 +23,42 @@ async def verify_google_admin(token: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        # Verify token using Google's tokeninfo API
         async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(f"https://oauth2.googleapis.com/tokeninfo?id_token={token}")
-            if resp.status_code != 200:
-                print(f"[AUTH] Google tokeninfo returned status {resp.status_code}: {resp.text}")
+            payload = None
+
+            # 1. If token looks like a JWT (3 dot-separated base64 parts)
+            if token.count(".") == 2:
+                resp = await client.get(f"https://oauth2.googleapis.com/tokeninfo?id_token={token}")
+                if resp.status_code == 200:
+                    payload = resp.json()
+
+            # 2. If token is an OAuth2 access token, verify via userinfo
+            if not payload:
+                resp = await client.get(
+                    "https://www.googleapis.com/oauth2/v3/userinfo",
+                    headers={"Authorization": f"Bearer {token}"}
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+
+            # 3. Fallback: verify access_token via tokeninfo
+            if not payload:
+                resp = await client.get(f"https://oauth2.googleapis.com/tokeninfo?access_token={token}")
+                if resp.status_code == 200:
+                    payload = resp.json()
+
+            if not payload:
+                print("[AUTH] Google could not verify token via id_token or access_token endpoints")
                 return None
-            
-            payload = resp.json()
+
             email = payload.get("email", "").lower()
             email_verified = payload.get("email_verified") == "true" or payload.get("email_verified") is True
 
             if not email or not email_verified:
-                print("[AUTH] Email unverified or missing in Google payload")
+                print(f"[AUTH] Email unverified ({email_verified}) or missing in Google payload")
                 return None
 
-            # If ADMIN_EMAILS is configured, enforce whitelist check
+            # Enforce ADMIN_EMAILS whitelist check
             if ADMIN_EMAILS and email not in ADMIN_EMAILS:
                 print(f"[AUTH] Email {email} is not in ADMIN_EMAILS whitelist ({ADMIN_EMAILS})")
                 return None
