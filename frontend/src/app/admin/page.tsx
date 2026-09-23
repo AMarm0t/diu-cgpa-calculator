@@ -201,14 +201,30 @@ export default function AdminPage() {
 
   const handleGoogleSignIn = () => {
     setAuthError("");
-    if (!tokenClientRef.current) {
-      if (typeof window !== "undefined" && window.google?.accounts?.oauth2) {
-        initGoogleAuth();
+    if (typeof window !== "undefined" && window.google?.accounts?.oauth2 && GOOGLE_CLIENT_ID) {
+      try {
+        // Initialize fresh client directly inside click event
+        // with error_callback to guarantee repeated clicks work in Edge & Chromium
+        const client = window.google.accounts.oauth2.initTokenClient({
+          client_id: GOOGLE_CLIENT_ID,
+          scope: "openid email profile",
+          callback: (response: any) => {
+            if (response?.access_token) {
+              verifyAndSetToken(response.access_token);
+            } else if (response?.error) {
+              setAuthError(`Google Sign-In error: ${response.error_description || response.error}`);
+            }
+          },
+          error_callback: (err: any) => {
+            console.warn("Google OAuth popup error or closed:", err);
+            setIsLoadingAuth(false);
+          },
+        });
+        tokenClientRef.current = client;
+        client.requestAccessToken({ prompt: "select_account" });
+      } catch (e: any) {
+        setAuthError(`Failed to launch Google Sign-In: ${e?.message || e}`);
       }
-    }
-    if (tokenClientRef.current) {
-      // prompt: 'select_account' forces the Google account chooser to pop up, allowing choice of any account!
-      tokenClientRef.current.requestAccessToken({ prompt: "select_account" });
     } else {
       setAuthError("Google Identity service is loading. Please try again in a moment.");
     }
@@ -419,10 +435,6 @@ export default function AdminPage() {
                     </svg>
                     <span>Sign in with Google</span>
                   </button>
-
-                  <p className="text-[11px] text-[#666666]">
-                    Select <span className="text-[#3ecf8e] font-mono">your admin Gmail</span> in the Google chooser
-                  </p>
                 </div>
               )}
             </div>
