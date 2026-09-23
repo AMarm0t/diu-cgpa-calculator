@@ -1,44 +1,65 @@
-# DIU Student Portal Result Scraper & Overall CGPA Calculator
+# DIU Student Portal Result Scraper & CGPA Platform
 
-This application allows DIU students to log in and automatically fetch their academic results from the DIU Student Portal, calculate their overall CGPA across all semesters, and display a comprehensive dashboard with GPA trends and course breakdowns.
+A full-stack, automated platform for Daffodil International University (DIU) students to view their academic transcripts, track running semester GPAs, and calculate their official overall CGPA in real-time.
+
+Built with **Camoufox** (stealth anti-detect browser), **FastAPI**, **Supabase**, and **Next.js 14**.
+
+---
+
+## 🚀 Key Features
+
+* **Headless Stealth Scraper**: Powered by Camoufox (custom Firefox engine) with human mouse kinematics and automatic Turnstile handling.
+* **Human-in-the-Loop Relay**: Interactive CAPTCHA challenge relay in modal if strict network verification is required.
+* **Transparent 1-Hour Database Caching**: Repeat student logins load instantly in **<200ms** directly from Supabase/SQLite.
+* **Google-Authenticated Admin Panel (`/admin`)**:
+  * Gated strictly behind Google OAuth with email whitelist (`ADMIN_EMAILS`).
+  * Supabase Studio dark theme.
+  * Inspect full student transcripts without needing passwords.
+  * One-click cache reset to force live portal scrapes.
+  * Student record deletion.
+* **Progressive Streaming**: Live SSE streaming card-by-card as each semester is loaded.
 
 ---
 
 ## 🏗️ Project Architecture
 
-- **Frontend**: Next.js 14, Tailwind CSS, Lucide Icons (`/frontend`)
-- **Backend**: FastAPI, Playwright (Edge/Chromium automation) (`/backend`)
-- **Scraper & Auth**: Automated browser session handling Keycloak OIDC login and Cloudflare Turnstile verification.
+* **Frontend**: Next.js 14 (App Router), Tailwind CSS, Lucide Icons (`/frontend`)
+* **Backend**: FastAPI, Async Camoufox, Uvicorn (`/backend`)
+* **Database**: Supabase Cloud PostgreSQL with automatic local SQLite fallback (`/data`)
+* **Deployment**: Docker, Docker Compose, Oracle Cloud Always Free VM, Vercel
 
 ---
 
-## 🚀 How to Run
+## 🛠️ Local Development Setup
 
-### Step 1: Start Backend
-Double-click `start_backend.bat` or run:
-```cmd
-venv\Scripts\activate
-python backend\app.py
+### 1. Backend Setup
+```bash
+# Activate virtual environment
+venv\Scripts\activate   # Windows
+# source venv/bin/activate # Linux/Mac
+
+# Install dependencies
+pip install -r backend/requirements.txt
+pip install "camoufox[geoip]"
+
+# Run FastAPI backend
+python backend/app.py
 ```
 Backend runs at `http://localhost:8000`.
 
-### Step 2: Start Frontend
-Double-click `start_frontend.bat` or run:
-```cmd
+### 2. Frontend Setup
+```bash
 cd frontend
+npm install
 npm run dev
 ```
 Frontend runs at `http://localhost:3000`.
 
 ---
 
-## 📌 Usage Instructions
+## 🌐 Production Deployment
 
-1. Open `http://localhost:3000` in your web browser.
-2. Enter your **DIU Student ID** and **Password**.
-3. Click **View Results**.
-4. An automated Edge browser window will open pointing to the DIU portal login:
-   - When the **Cloudflare Turnstile** checkbox appears ("Verify you are human"), **click it**.
-   - The backend script will automatically fill your credentials and complete the sign-in.
-   - If a second Turnstile check appears on portal redirect, click it as well.
-5. The backend will intercept your authenticated session, fetch the semester results and GPA graph, calculate your overall CGPA, and stream the data right back to your dashboard!
+Refer to [**`DEPLOY_ORACLE_CLOUD.md`**](./DEPLOY_ORACLE_CLOUD.md) for full instructions on hosting:
+* **Backend:** Oracle Cloud Always Free VM (12GB RAM, 100% Free Forever)
+* **Frontend:** Vercel (Next.js)
+* **Database:** Supabase Cloud
