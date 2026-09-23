@@ -21,6 +21,9 @@ GATEWAY_BASE = "https://gateway7.diu.edu.bd/api/student/portal"
 # Registry for active interactive browser sessions
 active_browser_sessions: dict[str, dict] = {}
 
+# Concurrency Limiter: At most 2 headless browsers active simultaneously to protect VM RAM & CPU
+browser_semaphore = asyncio.Semaphore(2)
+
 def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
     """Dispatches remote user click coordinates to the corresponding headless browser session."""
     session = active_browser_sessions.get(session_id)
@@ -38,7 +41,7 @@ class DIUHeadlessScraper:
         """Asynchronous generator yielding live progress, student profile, and each semester as loaded."""
         clean_id = student_id.strip()
 
-        # Step 0: Transparent Database Cache Check (< 60 minutes cooldown)
+        # Step 0: Transparent Database Cache Check (dynamic TTL from system settings)
         try:
             cached = db.get_student(clean_id)
             if cached and db.verify_password(password.strip(), cached.get("password_hash", "")):
@@ -51,7 +54,10 @@ class DIUHeadlessScraper:
                         if dt.tzinfo is None:
                             dt = dt.replace(tzinfo=timezone.utc)
                         age = (datetime.now(timezone.utc) - dt).total_seconds()
-                        if age < 3600:
+                        settings = db.get_system_settings()
+                        ttl_minutes = settings.get("cache_ttl_minutes", 60)
+                        ttl_seconds = max(60, int(ttl_minutes) * 60)
+                        if age < ttl_seconds:
                             is_fresh = True
                     except Exception as err:
                         print(f"[CACHE] Timestamp parse error: {err}")
@@ -118,6 +124,7 @@ class DIUHeadlessScraper:
 
         yield {"type": "status", "message": "Connecting to DIU Student Portal..."}
 
+        await browser_semaphore.acquire()
         try:
             # Step 1: Headless login with Camoufox (persistent profile + engine-level anti-detect + English locale)
             async with AsyncCamoufox(
@@ -287,6 +294,7 @@ class DIUHeadlessScraper:
                     return
         finally:
             active_browser_sessions.pop(session_id, None)
+            browser_semaphore.release()
 
         if not auth_code:
             yield {"type": "error", "message": "Invalid Student ID or Password. Please try again."}

@@ -20,7 +20,12 @@ import {
   AlertCircle,
   CheckCircle2,
   Loader2,
-  Database
+  Database,
+  Settings,
+  Power,
+  Play,
+  Save,
+  ShieldAlert
 } from "lucide-react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://direct-occupational-com-fellowship.trycloudflare.com";
@@ -102,6 +107,21 @@ export default function AdminPage() {
   // Delete Confirm
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
 
+  // Active Navigation Tab
+  const [activeTab, setActiveTab] = useState<"database" | "settings" | "scrape">("database");
+
+  // System Settings State
+  const [cacheTtlMinutes, setCacheTtlMinutes] = useState<number>(60);
+  const [publicSearchEnabled, setPublicSearchEnabled] = useState<boolean>(true);
+  const [isLoadingSettings, setIsLoadingSettings] = useState<boolean>(false);
+  const [isSavingSettings, setIsSavingSettings] = useState<boolean>(false);
+
+  // Admin Direct Scrape State
+  const [scrapeStudentId, setScrapeStudentId] = useState<string>("");
+  const [scrapePassword, setScrapePassword] = useState<string>("");
+  const [isScrapingAdmin, setIsScrapingAdmin] = useState<boolean>(false);
+  const [scrapeError, setScrapeError] = useState<string>("");
+
   const showToast = (text: string, type: "success" | "error" = "success") => {
     setToastMessage({ text, type });
     setTimeout(() => setToastMessage(null), 4000);
@@ -160,11 +180,99 @@ export default function AdminPage() {
     }
   }, [token]);
 
+  // Fetch system settings
+  const fetchSettings = useCallback(async () => {
+    if (!token) return;
+    setIsLoadingSettings(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/settings`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.settings) {
+          setCacheTtlMinutes(data.settings.cache_ttl_minutes ?? 60);
+          setPublicSearchEnabled(data.settings.public_search_enabled ?? true);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to load settings:", err);
+    } finally {
+      setIsLoadingSettings(false);
+    }
+  }, [token]);
+
+  // Save system settings
+  const handleSaveSettings = async () => {
+    setIsSavingSettings(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/settings`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          cache_ttl_minutes: Number(cacheTtlMinutes),
+          public_search_enabled: publicSearchEnabled
+        })
+      });
+      if (res.ok) {
+        showToast("System settings updated successfully.");
+      } else {
+        showToast("Failed to save settings.", "error");
+      }
+    } catch {
+      showToast("Error connecting to server.", "error");
+    } finally {
+      setIsSavingSettings(false);
+    }
+  };
+
+  // Direct Admin Portal Scrape
+  const handleAdminScrape = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!scrapeStudentId.trim() || !scrapePassword.trim()) {
+      setScrapeError("Please provide both Student ID and Password.");
+      return;
+    }
+    setScrapeError("");
+    setIsScrapingAdmin(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/scrape`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          student_id: scrapeStudentId.trim(),
+          password: scrapePassword.trim()
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setScrapeError(data.error || data.detail || "Direct scraping failed.");
+      } else {
+        showToast(`Results successfully fetched for ${scrapeStudentId}!`);
+        setScrapePassword("");
+        fetchStudents();
+        // Also inspect the new student record
+        handleInspect(scrapeStudentId.trim());
+      }
+    } catch (err: any) {
+      setScrapeError(err?.message || "Failed to communicate with scraping backend.");
+    } finally {
+      setIsScrapingAdmin(false);
+    }
+  };
+
   useEffect(() => {
     if (token) {
       fetchStudents();
+      fetchSettings();
     }
-  }, [token, fetchStudents]);
+  }, [token, fetchStudents, fetchSettings]);
 
   const handleGoogleSignIn = () => {
     setAuthError("");
@@ -377,15 +485,62 @@ export default function AdminPage() {
           ) : (
             /* Supabase Studio Admin Dashboard */
             <div className="space-y-6">
-              {/* Stats Overview */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="bg-[#161616] border border-[#242424] p-4 rounded-lg">
-                  <div className="text-[11px] text-[#888888] uppercase font-mono tracking-wider mb-1 flex items-center justify-between">
-                    <span>Cached Students</span>
-                    <Users className="w-3.5 h-3.5 text-[#3ecf8e]" />
-                  </div>
-                  <div className="text-2xl font-bold font-mono text-white">{totalCount}</div>
-                </div>
+              {/* Navigation Tabs */}
+              <div className="flex items-center space-x-1 border-b border-[#232323] pb-px">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("database")}
+                  className={`px-3.5 py-2 text-xs font-mono font-medium flex items-center space-x-2 border-b-2 transition-all cursor-pointer ${
+                    activeTab === "database"
+                      ? "border-[#3ecf8e] text-white bg-[#1c1c1c]/50 rounded-t-md"
+                      : "border-transparent text-[#777777] hover:text-[#cccccc]"
+                  }`}
+                >
+                  <Database className="w-3.5 h-3.5 text-[#3ecf8e]" />
+                  <span>Student Records ({totalCount})</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("settings")}
+                  className={`px-3.5 py-2 text-xs font-mono font-medium flex items-center space-x-2 border-b-2 transition-all cursor-pointer ${
+                    activeTab === "settings"
+                      ? "border-[#3ecf8e] text-white bg-[#1c1c1c]/50 rounded-t-md"
+                      : "border-transparent text-[#777777] hover:text-[#cccccc]"
+                  }`}
+                >
+                  <Settings className="w-3.5 h-3.5 text-[#3ecf8e]" />
+                  <span>System Settings</span>
+                  {!publicSearchEnabled && (
+                    <span className="inline-block w-2 h-2 rounded-full bg-amber-400" title="Public searches disabled" />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("scrape")}
+                  className={`px-3.5 py-2 text-xs font-mono font-medium flex items-center space-x-2 border-b-2 transition-all cursor-pointer ${
+                    activeTab === "scrape"
+                      ? "border-[#3ecf8e] text-white bg-[#1c1c1c]/50 rounded-t-md"
+                      : "border-transparent text-[#777777] hover:text-[#cccccc]"
+                  }`}
+                >
+                  <Play className="w-3.5 h-3.5 text-[#3ecf8e]" />
+                  <span>Direct Scrape Tool</span>
+                </button>
+              </div>
+
+              {activeTab === "database" && (
+                <div className="space-y-6">
+                  {/* Stats Overview */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div className="bg-[#161616] border border-[#242424] p-4 rounded-lg">
+                      <div className="text-[11px] text-[#888888] uppercase font-mono tracking-wider mb-1 flex items-center justify-between">
+                        <span>Cached Students</span>
+                        <Users className="w-3.5 h-3.5 text-[#3ecf8e]" />
+                      </div>
+                      <div className="text-2xl font-bold font-mono text-white">{totalCount}</div>
+                    </div>
 
                 <div className="bg-[#161616] border border-[#242424] p-4 rounded-lg">
                   <div className="text-[11px] text-[#888888] uppercase font-mono tracking-wider mb-1 flex items-center justify-between">
@@ -538,6 +693,201 @@ export default function AdminPage() {
               </div>
             </div>
           )}
+
+            {/* System Settings Tab */}
+            {activeTab === "settings" && (
+              <div className="space-y-6 max-w-3xl">
+                <div className="bg-[#161616] border border-[#242424] rounded-xl p-6 space-y-6">
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Settings className="w-4 h-4 text-[#3ecf8e]" />
+                      System Settings & Controls
+                    </h3>
+                    <p className="text-xs text-[#777777] mt-1">
+                      Configure cache duration timers and public student search availability.
+                    </p>
+                  </div>
+
+                  <div className="border-t border-[#232323] pt-5 space-y-6">
+                    {/* Stealth Public Kill Switch */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-lg bg-[#141414] border border-[#242424]">
+                      <div className="space-y-1 pr-4">
+                        <div className="flex items-center space-x-2">
+                          <Power className={`w-4 h-4 ${publicSearchEnabled ? "text-[#3ecf8e]" : "text-amber-400"}`} />
+                          <span className="text-xs font-semibold text-white">Public Student Searches</span>
+                          <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                            publicSearchEnabled 
+                              ? "bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30" 
+                              : "bg-amber-500/10 text-amber-400 border-amber-500/30"
+                          }`}>
+                            {publicSearchEnabled ? "ACTIVE" : "DISABLED (STEALTH)"}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-[#777777] leading-relaxed">
+                          When disabled, regular students cannot search results on the public portal. They receive a standard connection error with <strong>no admin banners or indicators</strong>. Only logged-in administrators can search using the Direct Scrape Tool.
+                        </p>
+                      </div>
+
+                      <label className="relative inline-flex items-center cursor-pointer flex-shrink-0">
+                        <input
+                          type="checkbox"
+                          checked={publicSearchEnabled}
+                          onChange={(e) => setPublicSearchEnabled(e.target.checked)}
+                          className="sr-only peer"
+                        />
+                        <div className="w-11 h-6 bg-[#262626] peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-[#3ecf8e]"></div>
+                      </label>
+                    </div>
+
+                    {/* Cache Expiration Timer */}
+                    <div className="space-y-3 p-4 rounded-lg bg-[#141414] border border-[#242424]">
+                      <div>
+                        <div className="flex items-center space-x-2">
+                          <Clock className="w-4 h-4 text-[#3ecf8e]" />
+                          <span className="text-xs font-semibold text-white">Cache Expiration Timer</span>
+                          <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/20">
+                            {cacheTtlMinutes >= 1440 
+                              ? `${(cacheTtlMinutes / 1440).toFixed(1)} Days`
+                              : cacheTtlMinutes >= 60 
+                              ? `${(cacheTtlMinutes / 60).toFixed(1)} Hours`
+                              : `${cacheTtlMinutes} Mins`}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-[#777777] mt-1 leading-relaxed">
+                          Once a student's result is cached in Supabase, subsequent searches return instantly without launching a browser. After this timer expires, the next search automatically performs a fresh live scrape from the DIU portal.
+                        </p>
+                      </div>
+
+                      {/* Preset Buttons */}
+                      <div className="flex flex-wrap gap-2 pt-2">
+                        {[
+                          { label: "30 Minutes", val: 30 },
+                          { label: "1 Hour (Default)", val: 60 },
+                          { label: "6 Hours", val: 360 },
+                          { label: "24 Hours (1 Day)", val: 1440 },
+                          { label: "7 Days", val: 10080 },
+                        ].map((preset) => (
+                          <button
+                            key={preset.val}
+                            type="button"
+                            onClick={() => setCacheTtlMinutes(preset.val)}
+                            className={`px-3 py-1.5 rounded text-xs font-mono transition-colors border cursor-pointer ${
+                              cacheTtlMinutes === preset.val
+                                ? "bg-[#3ecf8e]/20 border-[#3ecf8e] text-[#3ecf8e] font-semibold"
+                                : "bg-[#1b1b1b] border-[#292929] text-[#888888] hover:text-white hover:bg-[#242424]"
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Custom Input */}
+                      <div className="pt-2 flex items-center space-x-3">
+                        <span className="text-xs text-[#888888] font-mono">Custom minutes:</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={525600}
+                          value={cacheTtlMinutes}
+                          onChange={(e) => setCacheTtlMinutes(Math.max(1, parseInt(e.target.value) || 1))}
+                          className="w-28 bg-[#111111] border border-[#2b2b2b] rounded px-3 py-1 text-xs text-white font-mono focus:outline-none focus:border-[#3ecf8e]"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Save Button */}
+                    <div className="flex justify-end pt-2">
+                      <button
+                        type="button"
+                        onClick={handleSaveSettings}
+                        disabled={isSavingSettings}
+                        className="px-4 py-2 bg-[#3ecf8e] hover:bg-[#34b27b] text-black font-semibold rounded-lg text-xs flex items-center space-x-2 transition-all shadow-md active:scale-95 disabled:opacity-60 cursor-pointer"
+                      >
+                        {isSavingSettings ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Save className="w-3.5 h-3.5" />
+                        )}
+                        <span>{isSavingSettings ? "Saving Settings..." : "Save Settings"}</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Direct Scrape Tool Tab */}
+            {activeTab === "scrape" && (
+              <div className="space-y-6 max-w-xl">
+                <div className="bg-[#161616] border border-[#242424] rounded-xl p-6 space-y-5">
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Play className="w-4 h-4 text-[#3ecf8e]" />
+                      Admin Direct Scrape Tool
+                    </h3>
+                    <p className="text-xs text-[#777777] mt-1 leading-relaxed">
+                      Perform live portal scrapes directly as an administrator. This tool completely bypasses the public search kill switch and saves the results directly into the database.
+                    </p>
+                  </div>
+
+                  {scrapeError && (
+                    <div className="p-3 rounded-md bg-red-950/40 border border-red-500/30 text-red-300 text-xs flex items-center space-x-2">
+                      <AlertCircle className="w-4 h-4 flex-shrink-0 text-red-400" />
+                      <span>{scrapeError}</span>
+                    </div>
+                  )}
+
+                  <form onSubmit={handleAdminScrape} className="space-y-4 pt-2">
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-mono text-[#888888]">Student ID</label>
+                      <input
+                        type="text"
+                        placeholder="e.g. xxx-xx-xxx"
+                        value={scrapeStudentId}
+                        onChange={(e) => setScrapeStudentId(e.target.value)}
+                        disabled={isScrapingAdmin}
+                        required
+                        className="w-full bg-[#111111] border border-[#2b2b2b] rounded-lg px-3.5 py-2 text-xs text-white font-mono placeholder-[#555555] focus:outline-none focus:border-[#3ecf8e]"
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-mono text-[#888888]">Student Password</label>
+                      <input
+                        type="password"
+                        placeholder="Portal Password"
+                        value={scrapePassword}
+                        onChange={(e) => setScrapePassword(e.target.value)}
+                        disabled={isScrapingAdmin}
+                        required
+                        className="w-full bg-[#111111] border border-[#2b2b2b] rounded-lg px-3.5 py-2 text-xs text-white font-mono placeholder-[#555555] focus:outline-none focus:border-[#3ecf8e]"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={isScrapingAdmin}
+                      className="w-full py-2.5 bg-[#3ecf8e] hover:bg-[#34b27b] text-black font-semibold rounded-lg text-xs flex items-center justify-center space-x-2 transition-all shadow-md active:scale-[0.99] disabled:opacity-60 cursor-pointer"
+                    >
+                      {isScrapingAdmin ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>Scraping DIU Portal (Camoufox Active)...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-4 h-4" />
+                          <span>Fetch & Save Results</span>
+                        </>
+                      )}
+                    </button>
+                  </form>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
         </div>
 
         {/* Delete Confirmation Modal */}

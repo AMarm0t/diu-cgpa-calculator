@@ -110,19 +110,23 @@ def upsert_student(
     overall_cgpa: float,
     total_credits: float,
     completed_credits: float,
-    semesters: list
+    semesters: list,
+    custom_payload: Optional[dict] = None
 ) -> bool:
     """Inserts or updates a student result record."""
     clean_id = student_id.strip()
     pwd_hash = hash_password(password)
     now_iso = datetime.now(timezone.utc).isoformat()
-    results_payload = json.dumps({
-        "student": student_info,
-        "overall_cgpa": overall_cgpa,
-        "total_credits": total_credits,
-        "total_completed_credits": completed_credits,
-        "semesters": semesters
-    })
+    if custom_payload is not None:
+        results_payload = json.dumps(custom_payload)
+    else:
+        results_payload = json.dumps({
+            "student": student_info,
+            "overall_cgpa": overall_cgpa,
+            "total_credits": total_credits,
+            "total_completed_credits": completed_credits,
+            "semesters": semesters
+        })
 
     client = get_supabase()
     if client:
@@ -180,7 +184,7 @@ def list_all_students() -> List[Dict[str, Any]]:
         try:
             res = client.table("student_results").select(
                 "student_id, student_name, department, campus, overall_cgpa, total_credits, completed_credits, last_fetched_at"
-            ).order("last_fetched_at", desc=True).execute()
+            ).neq("student_id", "__SYSTEM_SETTINGS__").order("last_fetched_at", desc=True).execute()
             return res.data or []
         except Exception as e:
             print(f"[DB] Supabase error in list_all_students: {e}")
@@ -194,9 +198,36 @@ def list_all_students() -> List[Dict[str, Any]]:
         cursor.execute("""
             SELECT student_id, student_name, department, campus, overall_cgpa, total_credits, completed_credits, last_fetched_at 
             FROM student_results 
+            WHERE student_id != '__SYSTEM_SETTINGS__'
             ORDER BY last_fetched_at DESC
         """)
         return [dict(r) for r in cursor.fetchall()]
+
+def get_system_settings() -> Dict[str, Any]:
+    """Retrieves system settings from database or returns defaults."""
+    default_settings = {
+        "cache_ttl_minutes": 60,
+        "public_search_enabled": True
+    }
+    row = get_student("__SYSTEM_SETTINGS__")
+    if row and isinstance(row.get("results_json"), dict):
+        return {**default_settings, **row["results_json"]}
+    return default_settings
+
+def update_system_settings(new_settings: Dict[str, Any]) -> bool:
+    """Updates system settings in database."""
+    current = get_system_settings()
+    current.update(new_settings)
+    return upsert_student(
+        student_id="__SYSTEM_SETTINGS__",
+        password="system_settings_key",
+        student_info={"name": "System Configuration"},
+        overall_cgpa=0.0,
+        total_credits=0.0,
+        completed_credits=0.0,
+        semesters=[],
+        custom_payload=current
+    )
 
 def reset_student_cache(student_id: str) -> bool:
     """Sets last_fetched_at to 1970 so next student login re-scrapes the portal."""

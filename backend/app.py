@@ -16,10 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import db
+from auth import verify_google_admin
 
 from scraper import DIUHeadlessScraper, dispatch_remote_click
 from cgpa_calculator import calculate_overall_cgpa
@@ -83,9 +86,23 @@ async def root():
     return {"status": "ok", "service": "DIU CGPA Calculator API (Headless)"}
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
-async def scrape_results(request: ScrapeRequest):
+async def scrape_results(request: ScrapeRequest, authorization: Optional[str] = Header(None)):
     if not request.student_id or not request.password:
         raise HTTPException(status_code=400, detail="Student ID and password are required")
+    
+    # Check if public searches are currently enabled
+    settings = db.get_system_settings()
+    if not settings.get("public_search_enabled", True):
+        is_admin = False
+        if authorization and authorization.startswith("Bearer "):
+            admin_data = await verify_google_admin(authorization.split()[1])
+            if admin_data:
+                is_admin = True
+        if not is_admin:
+            return ScrapeResponse(
+                success=False,
+                error="Unable to connect to DIU Student Portal. Please try again later."
+            )
     
     scraper = DIUHeadlessScraper()
     try:
@@ -115,10 +132,31 @@ async def scrape_results(request: ScrapeRequest):
         )
 
 @app.post("/api/scrape-stream")
-async def scrape_stream_endpoint(request: ScrapeRequest):
+async def scrape_stream_endpoint(request: ScrapeRequest, authorization: Optional[str] = Header(None)):
     if not request.student_id or not request.password:
         raise HTTPException(status_code=400, detail="Student ID and password are required")
     
+    # Check if public searches are currently enabled
+    settings = db.get_system_settings()
+    if not settings.get("public_search_enabled", True):
+        is_admin = False
+        if authorization and authorization.startswith("Bearer "):
+            admin_data = await verify_google_admin(authorization.split()[1])
+            if admin_data:
+                is_admin = True
+        if not is_admin:
+            async def disabled_generator():
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Unable to connect to DIU Student Portal. Please try again later.'})}\n\n"
+            return StreamingResponse(
+                disabled_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+
     scraper = DIUHeadlessScraper()
     async def event_generator():
         try:
@@ -162,9 +200,6 @@ async def calculate_cgpa_manual(data: dict):
 # ==========================================
 # ADMIN ENDPOINTS (Google Auth Protected)
 # ==========================================
-import db
-from auth import verify_google_admin
-from fastapi import Header, Depends
 
 @app.on_event("startup")
 async def on_startup():
@@ -214,6 +249,36 @@ async def admin_delete_student(student_id: str, admin: dict = Depends(get_curren
     """Permanently deletes student records and cached browser profile from database."""
     db.delete_student(student_id)
     return {"status": "ok", "message": f"Student {student_id} permanently removed from database."}
+
+class SettingsUpdateRequest(BaseModel):
+    cache_ttl_minutes: Optional[int] = None
+    public_search_enabled: Optional[bool] = None
+
+@app.get("/api/admin/settings")
+async def admin_get_settings(admin: dict = Depends(get_current_admin)):
+    """Retrieves current global system settings."""
+    settings = db.get_system_settings()
+    return {"status": "ok", "settings": settings}
+
+@app.post("/api/admin/settings")
+async def admin_update_settings(req: SettingsUpdateRequest, admin: dict = Depends(get_current_admin)):
+    """Updates global system settings (cache TTL and public search toggle)."""
+    updates = {}
+    if req.cache_ttl_minutes is not None:
+        updates["cache_ttl_minutes"] = max(1, req.cache_ttl_minutes)
+    if req.public_search_enabled is not None:
+        updates["public_search_enabled"] = req.public_search_enabled
+    db.update_system_settings(updates)
+    return {"status": "ok", "settings": db.get_system_settings()}
+
+@app.post("/api/admin/scrape")
+async def admin_direct_scrape(req: ScrapeRequest, admin: dict = Depends(get_current_admin)):
+    """Admin-authenticated scrape tool that bypasses the public search kill switch."""
+    if not req.student_id or not req.password:
+        raise HTTPException(status_code=400, detail="Student ID and password are required")
+    scraper = DIUHeadlessScraper()
+    result = await scraper.scrape(student_id=req.student_id.strip(), password=req.password.strip())
+    return result
 
 
 if __name__ == "__main__":
