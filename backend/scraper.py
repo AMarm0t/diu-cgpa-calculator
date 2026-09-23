@@ -15,6 +15,7 @@ import httpx
 from camoufox.async_api import AsyncCamoufox
 import db
 from queue_manager import queue_manager, QueueCancelledException
+from cgpa_calculator import calculate_overall_cgpa
 
 LOGIN_URL = "https://auth1.diu.edu.bd/realms/diu-student/protocol/openid-connect/auth?client_id=student-portal-ui&redirect_uri=https%3A%2F%2Fstudentportal.diu.edu.bd%2F&response_type=code&scope=openid+profile+email"
 TOKEN_URL = "https://auth1.diu.edu.bd/realms/diu-student/protocol/openid-connect/token"
@@ -68,39 +69,26 @@ class DIUHeadlessScraper:
                         await asyncio.sleep(0.04)
                         yield {"type": "student", "data": results.get("student", {})}
 
-                        running_points = 0.0
-                        running_credits = 0.0
-                        total_completed = 0.0
-
+                        seen_semesters = []
                         for sem in results.get("semesters", []):
                             await asyncio.sleep(0.02)
-                            sem_earned = 0.0
-                            for c in sem.get("courses", []):
-                                cr = float(c.get("credits", 0.0) or 0.0)
-                                gp = float(c.get("grade_point", 0.0) or 0.0)
-                                gr = c.get("grade", "")
-                                if gr not in ["I", "W", "R"] and gp > 0:
-                                    running_credits += cr
-                                    running_points += (cr * gp)
-                                    sem_earned += cr
-                                elif gr == "F":
-                                    running_credits += cr
-                            total_completed += sem_earned
-                            running_cgpa = round(running_points / running_credits, 2) if running_credits > 0 else 0.0
+                            seen_semesters.append(sem)
+                            stats = calculate_overall_cgpa(seen_semesters)
 
                             yield {
                                 "type": "semester",
                                 "data": sem,
-                                "running_cgpa": running_cgpa,
-                                "total_credits": running_credits,
-                                "completed_credits": total_completed
+                                "running_cgpa": stats["overall_cgpa"],
+                                "total_credits": stats["total_credits"],
+                                "completed_credits": stats["total_earned_credits"]
                             }
 
+                        final_stats = calculate_overall_cgpa(results.get("semesters", []))
                         yield {
                             "type": "complete",
-                            "overall_cgpa": results.get("overall_cgpa", 0.0),
-                            "total_credits": results.get("total_credits", 0.0),
-                            "total_completed_credits": results.get("total_completed_credits", 0.0)
+                            "overall_cgpa": final_stats["overall_cgpa"],
+                            "total_credits": final_stats["total_credits"],
+                            "total_completed_credits": final_stats["total_earned_credits"]
                         }
                         return
         except Exception as e:
@@ -417,9 +405,6 @@ class DIUHeadlessScraper:
 
             # Step 5: Progressively Scan & Stream Each Semester Result
             semesters_found = []
-            grand_total_credits = 0.0
-            grand_total_weighted = 0.0
-            total_earned_credits = 0.0
 
             candidate_ids = set(active_semesters.keys())
             candidate_ids.update(range(60, 90))
@@ -462,12 +447,6 @@ class DIUHeadlessScraper:
                             sem_gpa = sem_weighted / sem_credits if sem_credits > 0 else 0.0
                             sem_name = active_semesters.get(sid, f"Semester {sid}")
 
-                            grand_total_weighted += sem_weighted
-                            grand_total_credits += sem_credits
-                            total_earned_credits += sem_earned
-
-                            running_cgpa = round(grand_total_weighted / grand_total_credits, 2) if grand_total_credits > 0 else 0.0
-
                             semester_item = {
                                 "name": sem_name,
                                 "gpa": round(sem_gpa, 2),
@@ -476,22 +455,26 @@ class DIUHeadlessScraper:
                             }
                             semesters_found.append(semester_item)
 
+                            stats = calculate_overall_cgpa(semesters_found)
+
                             # Stream this semester immediately to frontend!
                             yield {
                                 "type": "semester",
                                 "data": semester_item,
-                                "running_cgpa": running_cgpa,
-                                "total_credits": grand_total_credits,
-                                "completed_credits": total_earned_credits
+                                "running_cgpa": stats["overall_cgpa"],
+                                "total_credits": stats["total_credits"],
+                                "completed_credits": stats["total_earned_credits"]
                             }
                 except Exception:
                     pass
 
             # Step 6: If no course grades yet, check graph
-            final_overall_cgpa = 0.0
-            if grand_total_credits > 0:
-                final_overall_cgpa = round(grand_total_weighted / grand_total_credits, 2)
-            elif graph_data:
+            final_stats = calculate_overall_cgpa(semesters_found)
+            final_overall_cgpa = final_stats["overall_cgpa"]
+            final_total_credits = final_stats["total_credits"]
+            final_completed_credits = final_stats["total_earned_credits"]
+
+            if final_total_credits == 0 and graph_data:
                 valid_gpas = [float(item['cgpa']) for item in graph_data if float(item.get('cgpa', 0)) > 0]
                 if valid_gpas:
                     final_overall_cgpa = round(sum(valid_gpas) / len(valid_gpas), 2)
@@ -518,8 +501,8 @@ class DIUHeadlessScraper:
                     password=password,
                     student_info=student_info,
                     overall_cgpa=final_overall_cgpa,
-                    total_credits=grand_total_credits,
-                    completed_credits=total_earned_credits,
+                    total_credits=final_total_credits,
+                    completed_credits=final_completed_credits,
                     semesters=semesters_found
                 )
             except Exception as e:
@@ -529,8 +512,8 @@ class DIUHeadlessScraper:
             yield {
                 "type": "complete",
                 "overall_cgpa": final_overall_cgpa,
-                "total_credits": grand_total_credits,
-                "total_completed_credits": total_earned_credits
+                "total_credits": final_total_credits,
+                "total_completed_credits": final_completed_credits
             }
 
     async def scrape(self, student_id: str, password: str) -> dict:

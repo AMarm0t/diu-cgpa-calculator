@@ -71,27 +71,39 @@ def calculate_semester_gpa(courses: list[dict]) -> dict:
     }
 
 
+def normalize_course_code(code: str, title: str = "") -> str:
+    """Normalizes course code by removing spaces, hyphens, and converting to uppercase."""
+    clean_code = (code or "").strip().replace(" ", "").replace("-", "").upper()
+    if clean_code:
+        return clean_code
+    return (title or "").strip().lower()
+
+
 def calculate_overall_cgpa(semesters: list[dict]) -> dict:
     """
-    Calculate overall CGPA across all semesters.
+    Calculate overall CGPA across all semesters with retake deduplication:
+    - If a course appears more than once, only the attempt with the highest grade point is counted.
+    - If grade points are identical, the latest attempt is kept.
+    - Course credits are counted only once in total credits and completed credits.
+    - Lower attempts are excluded from overall CGPA and credit totals.
+    - Individual semester GPA and semester credits remain untouched.
     
     Args:
         semesters: List of semester dicts, each containing 'courses' list
         
     Returns:
-        Dict with overall_cgpa, total_credits, total_earned_credits, semester_gpas
+        Dict with overall_cgpa, total_credits, total_earned_credits, semesters
     """
-    grand_total_weighted = 0.0
-    grand_total_credits = 0.0
-    grand_total_earned = 0.0
     semester_results = []
+    course_attempts: dict[str, list[dict]] = {}
+    standalone_semesters = []
     
-    for semester in semesters:
+    for sem_idx, semester in enumerate(semesters):
         courses = semester.get('courses', [])
         if not courses:
             # If no courses but has gpa and credits directly
-            gpa = semester.get('gpa', 0)
-            credits = semester.get('credits', 0)
+            gpa = float(semester.get('gpa', 0.0) or 0.0)
+            credits = float(semester.get('credits', 0.0) or 0.0)
             if gpa and credits:
                 semester_results.append({
                     "name": semester.get('name', 'Unknown'),
@@ -99,14 +111,10 @@ def calculate_overall_cgpa(semesters: list[dict]) -> dict:
                     "credits": float(credits),
                     "courses": [],
                 })
-                grand_total_weighted += float(gpa) * float(credits)
-                grand_total_credits += float(credits)
-                if float(gpa) > 0:
-                    grand_total_earned += float(credits)
+                standalone_semesters.append((float(gpa), float(credits)))
             continue
         
         sem_result = calculate_semester_gpa(courses)
-        
         semester_results.append({
             "name": semester.get('name', 'Unknown'),
             "gpa": sem_result["gpa"],
@@ -115,16 +123,70 @@ def calculate_overall_cgpa(semesters: list[dict]) -> dict:
             "courses": courses,
         })
         
-        grand_total_weighted += sem_result["total_weighted"]
-        grand_total_credits += sem_result["total_credits"]
-        grand_total_earned += sem_result["earned_credits"]
+        for c in courses:
+            code = c.get("code") or c.get("courseCode") or ""
+            title = c.get("name") or c.get("courseTitle") or ""
+            key = normalize_course_code(code, title)
+            if not key:
+                continue
+                
+            cr = float(c.get("credits", 0.0) or c.get("courseCredit", 0.0) or 0.0)
+            gp = c.get("grade_point")
+            if gp is None:
+                gp = c.get("pointEquivalent")
+            if gp is None:
+                grade_str = c.get("grade") or c.get("gradeLetter") or ""
+                gp = grade_to_point(grade_str)
+            gp = float(gp or 0.0)
+            gr = (c.get("grade") or c.get("gradeLetter") or "").strip().upper()
+            
+            # Skip incomplete/withdrawn/retake markers with no credit
+            if gr in ["I", "W", "R"]:
+                continue
+                
+            if key not in course_attempts:
+                course_attempts[key] = []
+                
+            course_attempts[key].append({
+                "sem_idx": sem_idx,
+                "credits": cr,
+                "grade_point": gp,
+                "grade": gr,
+            })
+
+    grand_total_weighted = 0.0
+    grand_total_credits = 0.0
+    grand_total_earned = 0.0
     
+    for key, attempts in course_attempts.items():
+        # Select best attempt: highest grade_point, then latest sem_idx
+        best = max(attempts, key=lambda a: (a["grade_point"], a["sem_idx"]))
+        cr = best["credits"]
+        gp = best["grade_point"]
+        gr = best["grade"]
+        
+        if cr <= 0:
+            continue
+            
+        if gr == "F":
+            grand_total_credits += cr
+        elif gp > 0:
+            grand_total_weighted += cr * gp
+            grand_total_credits += cr
+            grand_total_earned += cr
+
+    for gpa, credits in standalone_semesters:
+        grand_total_weighted += gpa * credits
+        grand_total_credits += credits
+        if gpa > 0:
+            grand_total_earned += credits
+
     overall_cgpa = grand_total_weighted / grand_total_credits if grand_total_credits > 0 else 0.0
     
     return {
         "overall_cgpa": round(overall_cgpa, 2),
-        "total_credits": grand_total_credits,
-        "total_earned_credits": grand_total_earned,
+        "total_credits": round(grand_total_credits, 2),
+        "total_earned_credits": round(grand_total_earned, 2),
         "semesters": semester_results,
     }
 
