@@ -1,7 +1,16 @@
 "use client";
 
-import { useState } from "react";
-import { ChevronDown, ChevronUp, AlertCircle, Loader2, CheckCircle2, ShieldCheck } from "lucide-react";
+import { useState, useEffect } from "react";
+import { 
+  ChevronDown, 
+  ChevronUp, 
+  AlertCircle, 
+  Loader2, 
+  CheckCircle2, 
+  ShieldCheck,
+  Sun,
+  Moon
+} from "lucide-react";
 
 interface Course {
   name: string;
@@ -45,9 +54,57 @@ interface ChallengeData {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://direct-occupational-com-fellowship.trycloudflare.com";
 
+function ThemeToggle({ isDark, onToggle }: { isDark: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono transition-all cursor-pointer shadow-xs ${
+        isDark
+          ? "bg-[#161616] hover:bg-[#202020] border-[#2b2b2b] text-[#cccccc] hover:text-white"
+          : "bg-white hover:bg-slate-100 border-slate-200 text-slate-700 hover:text-slate-900"
+      }`}
+      title={isDark ? "Switch to Light Mode" : "Switch to Dark Mode"}
+    >
+      {isDark ? (
+        <>
+          <Sun className="w-3.5 h-3.5 text-amber-400" />
+          <span>Light</span>
+        </>
+      ) : (
+        <>
+          <Moon className="w-3.5 h-3.5 text-slate-600" />
+          <span>Dark</span>
+        </>
+      )}
+    </button>
+  );
+}
+
 export default function Home() {
   const [studentId, setStudentId] = useState("");
   const [password, setPassword] = useState("");
+  
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
+
+  useEffect(() => {
+    const saved = typeof window !== "undefined" ? localStorage.getItem("theme") : null;
+    if (saved === "light" || saved === "dark") {
+      setTheme(saved);
+    } else {
+      setTheme("dark");
+    }
+  }, []);
+
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    try {
+      localStorage.setItem("theme", next);
+    } catch {}
+  };
+
+  const isDark = theme === "dark";
   
   const [isLoading, setIsLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("");
@@ -205,17 +262,25 @@ export default function Home() {
     <>
       {/* Interactive Human-in-the-Loop Challenge Modal */}
       {challengeData && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-6 text-center border border-slate-100 animate-in fade-in zoom-in duration-200">
-            <div className="w-12 h-12 rounded-full bg-teal-50 text-teal-600 flex items-center justify-center mx-auto mb-4">
+        <div className={`fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-xs ${
+          isDark ? "bg-black/80" : "bg-slate-900/60 backdrop-blur-sm"
+        }`}>
+          <div className={`rounded-2xl shadow-2xl max-w-sm w-full p-6 text-center border animate-in fade-in zoom-in duration-200 ${
+            isDark ? "bg-[#161616] border-[#2b2b2b] text-white" : "bg-white border-slate-100 text-slate-800"
+          }`}>
+            <div className={`w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4 border ${
+              isDark ? "bg-[#3ecf8e]/10 border-[#3ecf8e]/20 text-[#3ecf8e]" : "bg-teal-50 border-transparent text-teal-600"
+            }`}>
               <ShieldCheck className="w-6 h-6" />
             </div>
-            <h3 className="text-lg font-bold text-slate-800 mb-1">Quick Security Check</h3>
-            <p className="text-xs text-slate-500 mb-5">
+            <h3 className={`text-lg font-bold mb-1 ${isDark ? "text-white font-mono" : "text-slate-800"}`}>Quick Security Check</h3>
+            <p className={`text-xs mb-5 ${isDark ? "text-[#888888] font-mono" : "text-slate-500"}`}>
               Please click the verification box below to verify your request
             </p>
             
-            <div className="relative inline-block border border-slate-200 rounded-lg overflow-hidden cursor-pointer shadow-sm hover:border-teal-500 transition-colors">
+            <div className={`relative inline-block border rounded-lg overflow-hidden cursor-pointer shadow-sm transition-colors ${
+              isDark ? "border-[#2e2e2e] hover:border-[#3ecf8e]" : "border-slate-200 hover:border-teal-500"
+            }`}>
               <img 
                 src={challengeData.image} 
                 alt="Cloudflare Verification"
@@ -224,14 +289,16 @@ export default function Home() {
                 draggable={false}
               />
               {isClicking && (
-                <div className="absolute inset-0 bg-white/80 backdrop-blur-[1px] flex items-center justify-center space-x-2 text-teal-700 text-xs font-medium">
-                  <Loader2 className="w-4 h-4 animate-spin text-teal-600" />
+                <div className={`absolute inset-0 backdrop-blur-[1px] flex items-center justify-center space-x-2 text-xs font-medium ${
+                  isDark ? "bg-black/70 text-[#3ecf8e] font-mono" : "bg-white/80 text-teal-700"
+                }`}>
+                  <Loader2 className={`w-4 h-4 animate-spin ${isDark ? "text-[#3ecf8e]" : "text-teal-600"}`} />
                   <span>Solving challenge...</span>
                 </div>
               )}
             </div>
 
-            <p className="text-[11px] text-slate-400 mt-4">
+            <p className={`text-[11px] mt-4 ${isDark ? "text-[#666666] font-mono" : "text-slate-400"}`}>
               Click anywhere inside the verification box to proceed
             </p>
           </div>
@@ -242,27 +309,50 @@ export default function Home() {
         <Dashboard
           data={data}
           isStreaming={isStreaming}
+          isDark={isDark}
+          onToggleTheme={toggleTheme}
           onLogout={() => {
             setData(null);
             setPassword("");
           }}
         />
       ) : (
-        <main className="min-h-screen flex items-center justify-center p-4 bg-slate-50">
-          <div className="max-w-md w-full bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-100">
-            <div className="bg-teal-700 p-8 text-center">
-              <h1 className="text-3xl font-bold text-white mb-2">DIU CGPA Calculator</h1>
-              <p className="text-teal-100 text-sm">Real-time Student Portal Scraper</p>
+        <main className={`min-h-screen flex items-center justify-center p-4 relative ${
+          isDark ? "bg-[#0e0e0e] text-[#ededed]" : "bg-slate-50 text-slate-900"
+        }`}>
+          {/* Top-Right Theme Toggle */}
+          <div className="absolute top-5 right-5 flex items-center space-x-3">
+            <ThemeToggle isDark={isDark} onToggle={toggleTheme} />
+          </div>
+
+          <div className={`max-w-md w-full rounded-2xl shadow-xl overflow-hidden border transition-all ${
+            isDark ? "bg-[#141414] border-[#252525] shadow-2xl" : "bg-white border-slate-100 shadow-xl"
+          }`}>
+            <div className={`p-8 text-center ${
+              isDark ? "bg-[#181818] border-b border-[#252525]" : "bg-teal-700"
+            }`}>
+              <h1 className="text-3xl font-bold text-white mb-2 tracking-tight">DIU CGPA Calculator</h1>
+              <p className={`text-sm ${isDark ? "text-[#3ecf8e] font-mono text-xs" : "text-teal-100"}`}>
+                Real-time Student Portal Scraper
+              </p>
             </div>
             
             <div className="p-8">
               <form onSubmit={handleSubmit} className="space-y-6">
                 <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Student ID</label>
+                  <label className={`block mb-2 ${
+                    isDark ? "text-xs font-mono uppercase tracking-wider text-[#888888]" : "text-sm font-medium text-slate-700"
+                  }`}>
+                    Student ID
+                  </label>
                   <input
                     type="text"
                     required
-                    className="w-full px-4 py-3 rounded-lg border border-slate-300 focus:ring-2 focus:ring-teal-500 focus:border-teal-500 outline-none transition"
+                    className={`w-full px-4 py-3 rounded-lg border outline-none transition ${
+                      isDark
+                        ? "bg-[#101010] border-[#2b2b2b] text-white font-mono placeholder-[#555555] focus:border-[#3ecf8e] focus:ring-1 focus:ring-[#3ecf8e]"
+                        : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
+                    }`}
                     placeholder="e.g. xxx-xx-xxx"
                     value={studentId}
                     onChange={(e) => setStudentId(e.target.value)}
@@ -270,11 +360,19 @@ export default function Home() {
                 </div>
                 
                 <div>
-                  <label className="block text-sm font-medium text-slate-700 mb-2">Portal Password</label>
+                  <label className={`block mb-2 ${
+                    isDark ? "text-xs font-mono uppercase tracking-wider text-[#888888]" : "text-sm font-medium text-slate-700"
+                  }`}>
+                    Portal Password
+                  </label>
                   <input
                     type="password"
                     required
-                    className="w-full px-4 py-3 rounded-lg border border-slate-300 focus:ring-2 focus:ring-teal-500 focus:border-teal-500 outline-none transition"
+                    className={`w-full px-4 py-3 rounded-lg border outline-none transition ${
+                      isDark
+                        ? "bg-[#101010] border-[#2b2b2b] text-white font-mono placeholder-[#555555] focus:border-[#3ecf8e] focus:ring-1 focus:ring-[#3ecf8e]"
+                        : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
+                    }`}
                     placeholder="••••••••"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
@@ -282,8 +380,10 @@ export default function Home() {
                 </div>
 
                 {error && (
-                  <div className="bg-red-50 text-red-700 p-4 rounded-lg flex items-start space-x-3 text-sm">
-                    <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                  <div className={`p-4 rounded-lg flex items-start space-x-3 text-sm border ${
+                    isDark ? "bg-red-950/40 border-red-500/30 text-red-300" : "bg-red-50 border-transparent text-red-700"
+                  }`}>
+                    <AlertCircle className={`w-5 h-5 flex-shrink-0 mt-0.5 ${isDark ? "text-red-400" : "text-red-600"}`} />
                     <span>{error}</span>
                   </div>
                 )}
@@ -291,12 +391,16 @@ export default function Home() {
                 <button
                   type="submit"
                   disabled={isLoading}
-                  className="w-full bg-teal-600 hover:bg-teal-700 text-white font-semibold py-3 px-4 rounded-lg transition-colors flex items-center justify-center disabled:opacity-70 disabled:cursor-not-allowed shadow-md"
+                  className={`w-full font-semibold py-3 px-4 rounded-lg transition-all flex items-center justify-center disabled:opacity-70 disabled:cursor-not-allowed shadow-md cursor-pointer ${
+                    isDark
+                      ? "bg-[#3ecf8e] hover:bg-[#34b27b] text-black font-bold active:scale-[0.99] font-mono text-sm"
+                      : "bg-teal-600 hover:bg-teal-700 text-white font-semibold"
+                  }`}
                 >
                   {isLoading ? (
                     <>
-                      <Loader2 className="w-5 h-5 mr-2 animate-spin" />
-                      {loadingMsg}
+                      <Loader2 className={`w-5 h-5 mr-2 animate-spin ${isDark ? "text-black" : "text-white"}`} />
+                      <span>{loadingMsg}</span>
                     </>
                   ) : (
                     "View Results"
@@ -305,8 +409,12 @@ export default function Home() {
               </form>
 
               <div className="mt-8 text-center space-y-4">
-                <p className="text-xs text-slate-500 bg-slate-50 p-4 rounded-lg leading-relaxed">
-                  <strong>Security Notice:</strong> Your credentials are sent securely to the DIU student portal backend for verification. They are never saved or stored.
+                <p className={`text-xs p-4 rounded-lg leading-relaxed ${
+                  isDark
+                    ? "bg-[#101010] border border-[#222222] text-[#888888] font-mono"
+                    : "bg-slate-50 text-slate-500"
+                }`}>
+                  <strong className={isDark ? "text-[#cccccc]" : "text-slate-700"}>Security Notice:</strong> Your credentials are sent securely to the DIU student portal backend for verification. They are never saved or stored.
                 </p>
               </div>
             </div>
@@ -320,28 +428,41 @@ export default function Home() {
 function Dashboard({
   data,
   isStreaming,
-  onLogout
+  onLogout,
+  isDark,
+  onToggleTheme,
 }: {
   data: StudentData;
   isStreaming: boolean;
   onLogout: () => void;
+  isDark: boolean;
+  onToggleTheme: () => void;
 }) {
   return (
-    <div className="min-h-screen bg-slate-50">
-      <header className="bg-teal-700 text-white shadow-lg sticky top-0 z-10">
+    <div className={`min-h-screen ${isDark ? "bg-[#0e0e0e] text-[#ededed]" : "bg-slate-50 text-slate-900"}`}>
+      <header className={`shadow-lg sticky top-0 z-10 ${
+        isDark ? "bg-[#141414] border-b border-[#242424] text-white" : "bg-teal-700 text-white"
+      }`}>
         <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
           <div>
             <h1 className="text-xl font-bold">DIU Academic Portal</h1>
-            <p className="text-teal-100 text-sm">
+            <p className={`text-sm ${isDark ? "text-[#3ecf8e] font-mono text-xs" : "text-teal-100"}`}>
               {data.student.name || data.student.id} • {data.student.id}
             </p>
           </div>
-          <button 
-            onClick={onLogout}
-            className="text-sm bg-teal-800 hover:bg-teal-900 px-4 py-2 rounded-md transition-colors font-medium border border-teal-600"
-          >
-            Logout
-          </button>
+          <div className="flex items-center space-x-3">
+            <ThemeToggle isDark={isDark} onToggle={onToggleTheme} />
+            <button 
+              onClick={onLogout}
+              className={`text-sm px-4 py-2 rounded-md transition-colors font-medium border cursor-pointer ${
+                isDark
+                  ? "bg-[#1c1c1c] hover:bg-[#252525] border-[#2c2c2c] text-white"
+                  : "bg-teal-800 hover:bg-teal-900 border-teal-600 text-white"
+              }`}
+            >
+              Logout
+            </button>
+          </div>
         </div>
       </header>
 
@@ -349,22 +470,30 @@ function Dashboard({
         
         {/* Live Loading Banner */}
         {isStreaming ? (
-          <div className="bg-teal-50 border border-teal-200 text-teal-800 p-4 rounded-xl flex items-center justify-between shadow-sm animate-pulse">
+          <div className={`p-4 rounded-xl flex items-center justify-between shadow-sm animate-pulse border ${
+            isDark ? "bg-[#14231d] border-[#3ecf8e]/30 text-[#3ecf8e]" : "bg-teal-50 border-teal-200 text-teal-800"
+          }`}>
             <div className="flex items-center space-x-3">
-              <Loader2 className="w-5 h-5 animate-spin text-teal-600" />
+              <Loader2 className={`w-5 h-5 animate-spin ${isDark ? "text-[#3ecf8e]" : "text-teal-600"}`} />
               <span className="font-medium text-sm">Loading and calculating semesters in real-time...</span>
             </div>
-            <span className="text-xs font-semibold bg-teal-200/60 px-2.5 py-1 rounded-full text-teal-900">
+            <span className={`text-xs font-semibold px-2.5 py-1 rounded-full ${
+              isDark ? "bg-[#3ecf8e]/20 text-[#3ecf8e]" : "bg-teal-200/60 text-teal-900"
+            }`}>
               Live Streaming
             </span>
           </div>
         ) : (
-          <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 p-3.5 rounded-xl flex items-center justify-between shadow-sm text-sm">
+          <div className={`p-3.5 rounded-xl flex items-center justify-between shadow-sm text-sm border ${
+            isDark ? "bg-[#121c17] border-emerald-500/20 text-emerald-400 font-mono text-xs" : "bg-emerald-50 border-emerald-200 text-emerald-800"
+          }`}>
             <div className="flex items-center space-x-2.5">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+              <CheckCircle2 className={`w-4 h-4 ${isDark ? "text-[#3ecf8e]" : "text-emerald-600"}`} />
               <span className="font-medium">All published academic results loaded successfully</span>
             </div>
-            <span className="text-xs font-semibold bg-emerald-100 px-2 py-0.5 rounded text-emerald-700">
+            <span className={`text-xs font-semibold px-2 py-0.5 rounded ${
+              isDark ? "bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/30" : "bg-emerald-100 text-emerald-700"
+            }`}>
               Complete
             </span>
           </div>
@@ -372,37 +501,63 @@ function Dashboard({
 
         {/* Top Summary Cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 flex flex-col items-center justify-center text-center">
-            <p className="text-sm text-slate-500 font-medium uppercase tracking-wider mb-2">
+          <div className={`rounded-2xl shadow-sm border p-6 flex flex-col items-center justify-center text-center ${
+            isDark ? "bg-[#161616] border-[#242424]" : "bg-white border-slate-200"
+          }`}>
+            <p className={`text-sm font-medium uppercase tracking-wider mb-2 ${
+              isDark ? "text-[#888888] font-mono text-xs" : "text-slate-500"
+            }`}>
               Overall Weighted CGPA
             </p>
-            <p className="text-5xl font-extrabold text-teal-600 transition-all duration-300">
+            <p className={`text-5xl font-extrabold transition-all duration-300 ${
+              isDark ? "text-[#3ecf8e] font-mono" : "text-teal-600"
+            }`}>
               {data.overall_cgpa > 0 ? data.overall_cgpa.toFixed(2) : "0.00"}
             </p>
             {isStreaming && (
-              <span className="text-[11px] text-teal-500 mt-2 font-medium">Updating live...</span>
+              <span className={`text-[11px] mt-2 font-medium ${isDark ? "text-[#3ecf8e]/70" : "text-teal-500"}`}>
+                Updating live...
+              </span>
             )}
           </div>
           
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 flex flex-col justify-center">
-            <p className="text-sm text-slate-500 font-medium mb-1">Student Information</p>
-            <p className="font-semibold text-slate-800">{data.student.name || "Student"}</p>
-            <p className="text-slate-600 text-sm mt-0.5">{data.student.department} • Campus: {data.student.campus}</p>
+          <div className={`rounded-2xl shadow-sm border p-6 flex flex-col justify-center ${
+            isDark ? "bg-[#161616] border-[#242424]" : "bg-white border-slate-200"
+          }`}>
+            <p className={`text-sm font-medium mb-1 ${isDark ? "text-[#888888] font-mono text-xs uppercase" : "text-slate-500"}`}>
+              Student Information
+            </p>
+            <p className={`font-semibold ${isDark ? "text-white text-base" : "text-slate-800"}`}>
+              {data.student.name || "Student"}
+            </p>
+            <p className={`text-sm mt-0.5 ${isDark ? "text-[#a3a3a3] font-mono text-xs" : "text-slate-600"}`}>
+              {data.student.department} • Campus: {data.student.campus}
+            </p>
             {data.student.email && (
-              <p className="text-xs text-slate-400 mt-1 truncate">{data.student.email}</p>
+              <p className={`text-xs mt-1 truncate ${isDark ? "text-[#666666] font-mono" : "text-slate-400"}`}>
+                {data.student.email}
+              </p>
             )}
           </div>
           
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 flex flex-col justify-center">
-            <p className="text-sm text-slate-500 font-medium mb-1">Credits Summary</p>
+          <div className={`rounded-2xl shadow-sm border p-6 flex flex-col justify-center ${
+            isDark ? "bg-[#161616] border-[#242424]" : "bg-white border-slate-200"
+          }`}>
+            <p className={`text-sm font-medium mb-1 ${isDark ? "text-[#888888] font-mono text-xs uppercase" : "text-slate-500"}`}>
+              Credits Summary
+            </p>
             <div className="flex justify-between items-end mt-2">
               <div>
-                <p className="text-2xl font-bold text-slate-800">{data.total_completed_credits}</p>
-                <p className="text-xs text-slate-500">Completed Credits</p>
+                <p className={`text-2xl font-bold ${isDark ? "text-white font-mono" : "text-slate-800"}`}>
+                  {data.total_completed_credits}
+                </p>
+                <p className={`text-xs ${isDark ? "text-[#888888] font-mono" : "text-slate-500"}`}>Completed Credits</p>
               </div>
               <div className="text-right">
-                <p className="text-xl font-semibold text-slate-600">{data.total_credits}</p>
-                <p className="text-xs text-slate-500">Total Credits</p>
+                <p className={`text-xl font-semibold ${isDark ? "text-[#a3a3a3] font-mono" : "text-slate-600"}`}>
+                  {data.total_credits}
+                </p>
+                <p className={`text-xs ${isDark ? "text-[#888888] font-mono" : "text-slate-500"}`}>Total Credits</p>
               </div>
             </div>
           </div>
@@ -411,25 +566,27 @@ function Dashboard({
         {/* Semesters Grid */}
         <div>
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xl font-bold text-slate-800">
+            <h2 className={`text-xl font-bold ${isDark ? "text-white font-mono" : "text-slate-800"}`}>
               Semester Breakdowns ({data.semesters.length})
             </h2>
             {isStreaming && (
-              <span className="text-xs text-slate-400 flex items-center">
-                <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" /> Scanning more semesters...
+              <span className={`text-xs flex items-center ${isDark ? "text-[#888888] font-mono" : "text-slate-400"}`}>
+                <Loader2 className={`w-3.5 h-3.5 mr-1.5 animate-spin ${isDark ? "text-[#3ecf8e]" : ""}`} /> Scanning more semesters...
               </span>
             )}
           </div>
 
           {data.semesters.length === 0 ? (
-            <div className="bg-white rounded-xl border border-slate-200 p-12 text-center text-slate-400">
-              <Loader2 className="w-8 h-8 animate-spin mx-auto mb-3 text-teal-600" />
+            <div className={`rounded-xl border p-12 text-center ${
+              isDark ? "bg-[#161616] border-[#242424] text-[#666666] font-mono" : "bg-white border-slate-200 text-slate-400"
+            }`}>
+              <Loader2 className={`w-8 h-8 animate-spin mx-auto mb-3 ${isDark ? "text-[#3ecf8e]" : "text-teal-600"}`} />
               <p className="text-sm">Fetching and calculating your first semester...</p>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               {data.semesters.map((sem, i) => (
-                <SemesterCard key={i} semester={sem} />
+                <SemesterCard key={i} semester={sem} isDark={isDark} />
               ))}
             </div>
           )}
@@ -440,33 +597,47 @@ function Dashboard({
   );
 }
 
-function SemesterCard({ semester }: { semester: Semester }) {
+function SemesterCard({ semester, isDark }: { semester: Semester; isDark: boolean }) {
   const [expanded, setExpanded] = useState(true);
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden transition-all duration-300 hover:shadow-md animate-fadeIn">
+    <div className={`rounded-xl shadow-sm border overflow-hidden transition-all duration-300 hover:shadow-md animate-fadeIn ${
+      isDark ? "bg-[#161616] border-[#242424]" : "bg-white border-slate-200"
+    }`}>
       <div 
-        className="p-5 flex items-center justify-between cursor-pointer hover:bg-slate-50 transition-colors"
+        className={`p-5 flex items-center justify-between cursor-pointer transition-colors ${
+          isDark ? "hover:bg-[#1c1c1c]" : "hover:bg-slate-50"
+        }`}
         onClick={() => setExpanded(!expanded)}
       >
         <div>
-          <h3 className="font-bold text-slate-800 text-lg">{semester.name}</h3>
-          <p className="text-sm text-slate-500">{semester.credits} Total Credits</p>
+          <h3 className={`font-bold text-lg ${isDark ? "text-white font-mono" : "text-slate-800"}`}>{semester.name}</h3>
+          <p className={`text-sm ${isDark ? "text-[#888888] font-mono text-xs" : "text-slate-500"}`}>{semester.credits} Total Credits</p>
         </div>
         <div className="flex items-center space-x-4">
           <div className="text-right">
-            <span className="block text-xs text-slate-400 uppercase font-semibold">Semester GPA</span>
-            <span className="font-bold text-teal-600 text-xl">{semester.gpa > 0 ? semester.gpa.toFixed(2) : "0.00"}</span>
+            <span className={`block text-xs uppercase font-semibold ${isDark ? "text-[#666666] font-mono text-[10px]" : "text-slate-400"}`}>Semester GPA</span>
+            <span className={`font-bold text-xl ${isDark ? "text-[#3ecf8e] font-mono" : "text-teal-600"}`}>
+              {semester.gpa > 0 ? semester.gpa.toFixed(2) : "0.00"}
+            </span>
           </div>
-          {expanded ? <ChevronUp className="text-slate-400 w-5 h-5" /> : <ChevronDown className="text-slate-400 w-5 h-5" />}
+          {expanded ? (
+            <ChevronUp className={`w-5 h-5 ${isDark ? "text-[#666666]" : "text-slate-400"}`} />
+          ) : (
+            <ChevronDown className={`w-5 h-5 ${isDark ? "text-[#666666]" : "text-slate-400"}`} />
+          )}
         </div>
       </div>
       
       {expanded && semester.courses && semester.courses.length > 0 && (
-        <div className="border-t border-slate-100 bg-slate-50 p-4">
+        <div className={`border-t p-4 ${
+          isDark ? "border-[#222222] bg-[#121212]" : "border-slate-100 bg-slate-50"
+        }`}>
           <div className="overflow-x-auto">
             <table className="w-full text-sm text-left">
-              <thead className="text-xs text-slate-500 uppercase bg-slate-100/80">
+              <thead className={`text-xs uppercase ${
+                isDark ? "text-[#777777] font-mono text-[10px] bg-[#181818] border-b border-[#222222]" : "text-slate-500 bg-slate-100/80"
+              }`}>
                 <tr>
                   <th className="px-3 py-2 rounded-l">Course</th>
                   <th className="px-2 py-2 text-center">Cr.</th>
@@ -474,25 +645,32 @@ function SemesterCard({ semester }: { semester: Semester }) {
                   <th className="px-3 py-2 text-right rounded-r">GP</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className={isDark ? "divide-y divide-[#1e1e1e]" : ""}>
                 {semester.courses.map((course, i) => (
-                  <tr key={i} className="border-b border-slate-200/60 last:border-0 hover:bg-slate-100/50 transition-colors">
+                  <tr key={i} className={`border-b last:border-0 transition-colors ${
+                    isDark
+                      ? "border-[#1e1e1e] hover:bg-[#181818]"
+                      : "border-slate-200/60 hover:bg-slate-100/50"
+                  }`}>
                     <td className="px-3 py-2.5">
-                      <div className="font-medium text-slate-800">{course.code}</div>
-                      <div className="text-xs text-slate-500 truncate max-w-[200px] sm:max-w-xs">{course.name}</div>
+                      <div className={`font-medium ${isDark ? "text-[#3ecf8e] font-mono" : "text-slate-800"}`}>{course.code}</div>
+                      <div className={`text-xs truncate max-w-[200px] sm:max-w-xs ${isDark ? "text-[#cccccc]" : "text-slate-500"}`}>{course.name}</div>
                     </td>
-                    <td className="px-2 py-2.5 text-center font-medium">{course.credits}</td>
+                    <td className={`px-2 py-2.5 text-center font-medium ${isDark ? "text-[#cccccc] font-mono" : ""}`}>{course.credits}</td>
                     <td className="px-2 py-2.5 text-center">
                       <span className={`inline-block px-2 py-0.5 rounded text-xs font-bold ${
-                        course.grade === 'A+' || course.grade === 'A' ? 'bg-emerald-100 text-emerald-800' :
-                        course.grade === 'I' ? 'bg-amber-100 text-amber-800' :
-                        course.grade === 'F' ? 'bg-red-100 text-red-800' :
-                        'bg-slate-200 text-slate-700'
+                        course.grade === 'A+' || course.grade === 'A'
+                          ? (isDark ? "bg-emerald-950/60 text-[#3ecf8e] border border-emerald-500/30" : "bg-emerald-100 text-emerald-800")
+                          : course.grade === 'I'
+                          ? (isDark ? "bg-amber-950/60 text-amber-400 border border-amber-500/30" : "bg-amber-100 text-amber-800")
+                          : course.grade === 'F'
+                          ? (isDark ? "bg-red-950/60 text-red-400 border border-red-500/30" : "bg-red-100 text-red-800")
+                          : (isDark ? "bg-[#222222] text-[#aaaaaa]" : "bg-slate-200 text-slate-700")
                       }`}>
                         {course.grade || 'N/A'}
                       </span>
                     </td>
-                    <td className="px-3 py-2.5 text-right font-semibold text-slate-700">
+                    <td className={`px-3 py-2.5 text-right font-semibold ${isDark ? "text-[#aaaaaa] font-mono" : "text-slate-700"}`}>
                       {course.grade_point > 0 ? course.grade_point.toFixed(2) : "0.00"}
                     </td>
                   </tr>
