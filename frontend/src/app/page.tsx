@@ -117,7 +117,7 @@ export default function Home() {
 
   const [data, setData] = useState<StudentData | null>(null);
 
-  const handleChallengeClick = async (e: React.MouseEvent<HTMLImageElement>) => {
+  const handleChallengeClick = async (e: React.MouseEvent<HTMLElement> | React.TouchEvent<HTMLElement>) => {
     if (!challengeData || isClicking) return;
     setIsClicking(true);
 
@@ -127,19 +127,37 @@ export default function Home() {
     }, 8000);
 
     const rect = e.currentTarget.getBoundingClientRect();
-    const scaleX = (challengeData.box.width || rect.width) / rect.width;
-    const scaleY = (challengeData.box.height || rect.height) / rect.height;
+    const scaleX = (challengeData.box.width || rect.width) / (rect.width || 1);
+    const scaleY = (challengeData.box.height || rect.height) / (rect.height || 1);
 
-    const relX = (e.clientX - rect.left) * scaleX;
-    const relY = (e.clientY - rect.top) * scaleY;
+    let clientX = 0;
+    let clientY = 0;
+    if ("touches" in e && e.touches.length > 0) {
+      clientX = e.touches[0].clientX;
+      clientY = e.touches[0].clientY;
+    } else if ("clientX" in e) {
+      clientX = (e as React.MouseEvent).clientX;
+      clientY = (e as React.MouseEvent).clientY;
+    } else {
+      clientX = rect.left + 21;
+      clientY = rect.top + 33;
+    }
+
+    const relX = (clientX - rect.left) * scaleX;
+    const relY = (clientY - rect.top) * scaleY;
 
     // Standard Cloudflare Turnstile checkbox center inside widget (x: 21, y: 33)
-    let clickX = (challengeData.box.x || 0) + relX;
-    let clickY = (challengeData.box.y || 0) + relY;
+    let clickX = (challengeData.box.x || 0) + 21;
+    let clickY = (challengeData.box.y || 0) + 33;
 
-    if (relX < 210 && relY < 70) {
-      clickX = (challengeData.box.x || 0) + 21;
-      clickY = (challengeData.box.y || 0) + 33;
+    if (relX >= 0 && relY >= 0) {
+      if (relX < 210 && relY < 70) {
+        clickX = (challengeData.box.x || 0) + 21;
+        clickY = (challengeData.box.y || 0) + 33;
+      } else {
+        clickX = (challengeData.box.x || 0) + relX;
+        clickY = (challengeData.box.y || 0) + relY;
+      }
     }
 
     try {
@@ -170,6 +188,7 @@ export default function Home() {
       const response = await fetch(`${API_BASE}/api/scrape-stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify({ student_id: studentId.trim(), password: password.trim() }),
       });
 
@@ -291,14 +310,19 @@ export default function Home() {
               Please click the verification box below to verify your request
             </p>
             
-            <div className={`relative inline-block border rounded-lg overflow-hidden cursor-pointer shadow-sm transition-colors ${
-              isDark ? "border-[#2e2e2e] hover:border-[#3ecf8e]" : "border-slate-200 hover:border-teal-500"
-            }`}>
+            <div 
+              role="button"
+              tabIndex={0}
+              onClick={handleChallengeClick}
+              onTouchStart={handleChallengeClick}
+              className={`relative inline-block border rounded-lg overflow-hidden cursor-pointer shadow-sm transition-colors touch-manipulation select-none ${
+                isDark ? "border-[#2e2e2e] hover:border-[#3ecf8e]" : "border-slate-200 hover:border-teal-500"
+              }`}
+            >
               <img 
                 src={challengeData.image} 
                 alt="Cloudflare Verification"
-                onClick={handleChallengeClick}
-                className="block max-w-full select-none"
+                className="block max-w-full pointer-events-none select-none"
                 draggable={false}
               />
               {isClicking && (

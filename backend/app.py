@@ -159,6 +159,10 @@ async def scrape_stream_endpoint(request: ScrapeRequest, authorization: Optional
 
     scraper = DIUHeadlessScraper()
     async def event_generator():
+        # Flush initial 2KB SSE comment padding immediately.
+        # This forces WebKit/Safari (on iPad & iOS) and Cloudflare proxies
+        # to immediately dispatch stream chunks without buffering.
+        yield f": {' ' * 2048}\n\n"
         try:
             async for item in scraper.scrape_stream(request.student_id.strip(), request.password.strip()):
                 yield f"data: {json.dumps(item)}\n\n"
@@ -169,8 +173,7 @@ async def scrape_stream_endpoint(request: ScrapeRequest, authorization: Optional
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no"
         }
     )

@@ -236,8 +236,22 @@ class DIUHeadlessScraper:
                                             if coords:
                                                 click_x = float(coords["x"])
                                                 click_y = float(coords["y"])
-                                                await page.mouse.move(click_x, click_y, steps=8)
-                                                await page.mouse.click(click_x, click_y)
+                                                await page.mouse.move(click_x, click_y, steps=10)
+                                                await page.mouse.down()
+                                                await page.wait_for_timeout(100)
+                                                await page.mouse.up()
+
+                                                # Also trigger click on cf_frame checkbox if accessible
+                                                for f in page.frames:
+                                                    if "challenges.cloudflare.com" in f.url:
+                                                        try:
+                                                            cb = f.locator('input[type="checkbox"], label, .ctp-checkbox-label').first
+                                                            if await cb.count() > 0:
+                                                                await cb.click(timeout=1500)
+                                                        except Exception:
+                                                            pass
+                                                        break
+
                                                 yield {"type": "status", "message": "Verification received. Processing..."}
                                                 
                                                 # Fast poll for token resolution (every 300ms, up to 10s)
@@ -259,9 +273,14 @@ class DIUHeadlessScraper:
                                 except Exception:
                                     pass
 
+                        if has_turnstile and not token_val:
+                            # Keep waiting for Turnstile resolution; do not attempt credential entry yet
+                            continue
+
                         # If on standalone Turnstile step and solved, click continue
                         continue_btn = page.locator('#kc-turnstile-submit, input[type="submit"][name="continue"]').first
                         if await continue_btn.count() > 0 and token_val:
+                            yield {"type": "status", "message": "Security check passed. Loading login..."}
                             try:
                                 await continue_btn.click(no_wait_after=True, timeout=5000)
                             except Exception:

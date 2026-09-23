@@ -33,7 +33,7 @@ class QueueItem:
 
 
 class QueueManager:
-    def __init__(self, limit: int = 4):
+    def __init__(self, limit: int = 1):
         self.limit = limit
         self._running: List[QueueItem] = []
         self._waiting: List[QueueItem] = []
