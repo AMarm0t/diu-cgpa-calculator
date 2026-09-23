@@ -121,6 +121,13 @@ export default function AdminPage() {
   const [scrapePassword, setScrapePassword] = useState<string>("");
   const [isScrapingAdmin, setIsScrapingAdmin] = useState<boolean>(false);
   const [scrapeError, setScrapeError] = useState<string>("");
+  const [scrapeProgressMsg, setScrapeProgressMsg] = useState<string>("Connecting to DIU Student Portal...");
+  const [challengeData, setChallengeData] = useState<{
+    sessionId: string;
+    image: string;
+    box: { x: number; y: number; width: number; height: number };
+  } | null>(null);
+  const [isClickingChallenge, setIsClickingChallenge] = useState<boolean>(false);
 
   const showToast = (text: string, type: "success" | "error" = "success") => {
     setToastMessage({ text, type });
@@ -229,7 +236,43 @@ export default function AdminPage() {
     }
   };
 
-  // Direct Admin Portal Scrape
+  // Forward admin click coordinates to backend to solve Cloudflare Turnstile
+  const handleChallengeClick = async (e: React.MouseEvent<HTMLImageElement>) => {
+    if (!challengeData || isClickingChallenge) return;
+    setIsClickingChallenge(true);
+
+    const rect = e.currentTarget.getBoundingClientRect();
+    const scaleX = (challengeData.box.width || rect.width) / rect.width;
+    const scaleY = (challengeData.box.height || rect.height) / rect.height;
+
+    const relX = (e.clientX - rect.left) * scaleX;
+    const relY = (e.clientY - rect.top) * scaleY;
+
+    let clickX = (challengeData.box.x || 0) + relX;
+    let clickY = (challengeData.box.y || 0) + relY;
+
+    if (relX < 210 && relY < 70) {
+      clickX = (challengeData.box.x || 0) + 28;
+      clickY = (challengeData.box.y || 0) + 32;
+    }
+
+    try {
+      await fetch(`${API_BASE}/api/captcha-click`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: challengeData.sessionId,
+          x: clickX,
+          y: clickY
+        })
+      });
+    } catch (err) {
+      console.error("Failed to forward captcha click:", err);
+      setIsClickingChallenge(false);
+    }
+  };
+
+  // Direct Admin Portal Scrape with live SSE streaming
   const handleAdminScrape = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!scrapeStudentId.trim() || !scrapePassword.trim()) {
@@ -238,8 +281,11 @@ export default function AdminPage() {
     }
     setScrapeError("");
     setIsScrapingAdmin(true);
+    setScrapeProgressMsg("Connecting to DIU Student Portal...");
+    setChallengeData(null);
+
     try {
-      const res = await fetch(`${API_BASE}/api/admin/scrape`, {
+      const response = await fetch(`${API_BASE}/api/scrape-stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -250,20 +296,64 @@ export default function AdminPage() {
           password: scrapePassword.trim()
         })
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        setScrapeError(data.error || data.detail || "Direct scraping failed.");
-      } else {
-        showToast(`Results successfully fetched for ${scrapeStudentId}!`);
-        setScrapePassword("");
-        fetchStudents();
-        // Also inspect the new student record
-        handleInspect(scrapeStudentId.trim());
+
+      if (!response.ok || !response.body) {
+        throw new Error("Unable to communicate with scraping server.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+
+          try {
+            const payload = JSON.parse(trimmed.replace(/^data:\s*/, ""));
+
+            if (payload.type === "status") {
+              setScrapeProgressMsg(payload.message);
+            } else if (payload.type === "challenge_required") {
+              setChallengeData({
+                sessionId: payload.session_id,
+                image: payload.image,
+                box: payload.box || { x: 0, y: 0, width: 300, height: 65 }
+              });
+              setIsClickingChallenge(false);
+            } else if (payload.type === "challenge_solved") {
+              setChallengeData(null);
+              setIsClickingChallenge(false);
+              setScrapeProgressMsg("Verification passed! Logging in...");
+            } else if (payload.type === "error") {
+              throw new Error(payload.message || "Scraping failed.");
+            } else if (payload.type === "complete") {
+              showToast(`Results successfully fetched for ${scrapeStudentId}!`);
+              setScrapePassword("");
+              fetchStudents();
+              handleInspect(scrapeStudentId.trim());
+              setChallengeData(null);
+            }
+          } catch (jsonErr: any) {
+            if (jsonErr.message && !jsonErr.message.includes("Unexpected token")) {
+              throw jsonErr;
+            }
+          }
+        }
       }
     } catch (err: any) {
       setScrapeError(err?.message || "Failed to communicate with scraping backend.");
     } finally {
       setIsScrapingAdmin(false);
+      setChallengeData(null);
     }
   };
 
@@ -872,8 +962,8 @@ export default function AdminPage() {
                     >
                       {isScrapingAdmin ? (
                         <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          <span>Scraping DIU Portal (Camoufox Active)...</span>
+                          <Loader2 className="w-4 h-4 animate-spin text-black" />
+                          <span>{scrapeProgressMsg}</span>
                         </>
                       ) : (
                         <>
@@ -889,6 +979,43 @@ export default function AdminPage() {
           </div>
         )}
         </div>
+
+        {/* Interactive Human-in-the-Loop Turnstile Modal for Admin */}
+        {challengeData && (
+          <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-[#161616] border border-[#2b2b2b] rounded-xl max-w-sm w-full p-6 text-center shadow-2xl space-y-4">
+              <div className="w-10 h-10 rounded-full bg-[#3ecf8e]/10 border border-[#3ecf8e]/20 flex items-center justify-center mx-auto text-[#3ecf8e]">
+                <ShieldCheck className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-white">Security Verification</h3>
+                <p className="text-xs text-[#888888] mt-1">
+                  Cloudflare requires verification. Click the box below to complete:
+                </p>
+              </div>
+
+              <div className="relative inline-block border border-[#2e2e2e] hover:border-[#3ecf8e] rounded-lg overflow-hidden cursor-pointer transition-colors">
+                <img
+                  src={challengeData.image}
+                  alt="Cloudflare Verification"
+                  onClick={handleChallengeClick}
+                  className="block max-w-full select-none"
+                  draggable={false}
+                />
+                {isClickingChallenge && (
+                  <div className="absolute inset-0 bg-black/70 backdrop-blur-[1px] flex items-center justify-center space-x-2 text-[#3ecf8e] text-xs font-mono">
+                    <Loader2 className="w-4 h-4 animate-spin text-[#3ecf8e]" />
+                    <span>Dispatching click...</span>
+                  </div>
+                )}
+              </div>
+
+              <p className="text-[11px] text-[#666666] font-mono">
+                Click inside the checkbox to proceed immediately.
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Delete Confirmation Modal */}
         {deleteTargetId && (
