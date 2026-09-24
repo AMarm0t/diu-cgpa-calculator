@@ -40,38 +40,71 @@ class QueueManager:
         self._lock = asyncio.Lock()
         self._condition = asyncio.Condition(self._lock)
 
-    async def acquire(self, student_id: str) -> str:
+    async def acquire_stream(self, student_id: str):
         """
-        Enqueues a scrape request. Suspends coroutine until a worker slot is available.
+        Enqueues a scrape request.
+        Yields queue position events while waiting in line,
+        then yields {'type': 'acquired', 'queue_id': queue_id} once a worker slot is allocated.
         Raises QueueCancelledException if cancelled by an administrator while waiting.
-        Returns queue_id.
         """
         item = QueueItem(student_id)
 
         async with self._condition:
             self._waiting.append(item)
 
+        try:
+            last_reported_pos = None
             while True:
-                # Check if this item was cancelled
-                if item.cancel_event.is_set():
-                    if item in self._waiting:
-                        self._waiting.remove(item)
-                    raise QueueCancelledException(f"Request for {student_id} was cancelled by administrator.")
+                async with self._condition:
+                    # Check if this item was cancelled
+                    if item.cancel_event.is_set():
+                        if item in self._waiting:
+                            self._waiting.remove(item)
+                        raise QueueCancelledException(f"Request for {student_id} was cancelled by administrator.")
 
-                # If a worker slot is free and this item is next in line
-                if len(self._running) < self.limit and self._waiting and self._waiting[0] == item:
-                    self._waiting.pop(0)
-                    item.status = "running"
-                    item.started_at = datetime.now(timezone.utc).isoformat()
-                    self._running.append(item)
-                    return item.queue_id
+                    # If a worker slot is free and this item is next in line
+                    if len(self._running) < self.limit and self._waiting and self._waiting[0] == item:
+                        self._waiting.pop(0)
+                        item.status = "running"
+                        item.started_at = datetime.now(timezone.utc).isoformat()
+                        self._running.append(item)
+                        yield {"type": "acquired", "queue_id": item.queue_id}
+                        return
 
-                # Wait for a state change (worker release or cancellation)
-                # We use a timeout so cancel events or edge cases are guaranteed to wake up
+                    # Compute current position in line (1-indexed)
+                    pos = (self._waiting.index(item) + 1) if item in self._waiting else 1
+
+                # If position changed, inform the client
+                if pos != last_reported_pos:
+                    last_reported_pos = pos
+                    yield {
+                        "type": "queue",
+                        "position": pos,
+                        "message": f"Server busy. Position #{pos} in queue. Scraping starts automatically..."
+                    }
+
+                # Wait for worker release or cancellation
                 try:
-                    await asyncio.wait_for(self._condition.wait(), timeout=1.0)
+                    async with self._condition:
+                        await asyncio.wait_for(self._condition.wait(), timeout=1.0)
                 except asyncio.TimeoutError:
                     pass
+        except Exception:
+            async with self._condition:
+                if item in self._waiting:
+                    self._waiting.remove(item)
+            raise
+
+    async def acquire(self, student_id: str) -> str:
+        """
+        Enqueues a scrape request synchronously. Suspends coroutine until a worker slot is available.
+        Raises QueueCancelledException if cancelled by an administrator while waiting.
+        Returns queue_id.
+        """
+        async for event in self.acquire_stream(student_id):
+            if event.get("type") == "acquired":
+                return event["queue_id"]
+        raise RuntimeError("Failed to acquire worker slot from queue.")
 
     async def release(self, queue_id: str):
         """Releases the worker slot occupied by queue_id and notifies the next waiting item."""
@@ -134,5 +167,5 @@ class QueueManager:
         }
 
 
-# Global singleton instance
-queue_manager = QueueManager(limit=4)
+# Global singleton instance (limit=1 ensures 1GB RAM VM never thrashes swap with concurrent browsers)
+queue_manager = QueueManager(limit=1)

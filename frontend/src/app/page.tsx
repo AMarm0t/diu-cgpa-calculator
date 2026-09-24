@@ -217,7 +217,7 @@ export default function Home() {
           try {
             const payload = JSON.parse(trimmed.replace(/^data:\s*/, ""));
 
-            if (payload.type === "status") {
+            if (payload.type === "status" || payload.type === "queue") {
               setLoadingMsg(payload.message);
             } else if (payload.type === "challenge_required") {
               if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);

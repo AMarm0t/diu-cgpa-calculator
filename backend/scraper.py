@@ -120,8 +120,14 @@ class DIUHeadlessScraper:
 
         yield {"type": "status", "message": "Connecting to DIU Student Portal..."}
 
+        queue_id = None
         try:
-            queue_id = await queue_manager.acquire(clean_id)
+            async for q_event in queue_manager.acquire_stream(clean_id):
+                if q_event.get("type") == "queue":
+                    yield q_event
+                elif q_event.get("type") == "acquired":
+                    queue_id = q_event.get("queue_id")
+                    break
         except QueueCancelledException:
             yield {"type": "error", "message": "Scrape request was cancelled by administrator."}
             return
@@ -158,7 +164,21 @@ class DIUHeadlessScraper:
 
                 try:
                     yield {"type": "status", "message": "Passing security verification..."}
-                    await page.goto(LOGIN_URL, timeout=35000, wait_until="domcontentloaded")
+                    # Fast commit navigation prevents dropping connections on slow external assets
+                    try:
+                        await page.goto(LOGIN_URL, timeout=45000, wait_until="commit")
+                    except Exception as nav_e:
+                        print(f"[NAV] Page commit wait failed ({nav_e}), trying domcontentloaded...")
+                        await page.goto(LOGIN_URL, timeout=45000, wait_until="domcontentloaded")
+
+                    # Wait for either username input OR turnstile widget to be attached to DOM
+                    try:
+                        await page.wait_for_selector(
+                            'input#username, #kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]',
+                            timeout=30000
+                        )
+                    except Exception:
+                        pass
 
                     # Loop through challenge and login steps
                     for attempt in range(45):
@@ -168,7 +188,11 @@ class DIUHeadlessScraper:
 
                         await page.wait_for_timeout(400)
 
-                        # Check if Turnstile widget is present on current page
+                        # Check if username field is present and ready
+                        username_input = page.locator('#username').first
+                        has_username = await username_input.count() > 0
+
+                        # Check if Turnstile widget is present on the current page
                         widget = page.locator('#kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]').first
                         has_turnstile = await widget.count() > 0
 
@@ -177,30 +201,84 @@ class DIUHeadlessScraper:
                             return el && el.value ? el.value : null;
                         }""")
 
+                        # If on standalone Turnstile step and solved, click continue
+                        continue_btn = page.locator('#kc-turnstile-submit, input[type="submit"][name="continue"]').first
+                        if await continue_btn.count() > 0 and token_val:
+                            yield {"type": "status", "message": "Security check passed. Loading login..."}
+                            try:
+                                await continue_btn.click(no_wait_after=True, timeout=5000)
+                            except Exception:
+                                await page.evaluate("() => { const f = document.querySelector('#kc-turnstile-form'); if (f) f.submit(); }")
+                            await page.wait_for_timeout(1000)
+                            continue
+
                         # If Turnstile is active and not yet solved:
                         if has_turnstile and not token_val:
-                            # Allow Camoufox 3-4s to pass Turnstile automatically in the background
-                            for _ in range(6):
-                                await page.wait_for_timeout(500)
+                            # Allow Camoufox up to 6 seconds to pass Turnstile automatically in the background
+                            for _ in range(12):
+                                check_url(page.url)
+                                if auth_code:
+                                    break
                                 token_val = await page.evaluate("""() => {
                                     const el = document.querySelector('[name="cf-turnstile-response"]');
                                     return el && el.value ? el.value : null;
                                 }""")
                                 if token_val:
                                     break
+                                # If page already transitioned to login form without needing standalone token
+                                if not has_username and await page.locator('#username').count() > 0:
+                                    has_username = True
+                                    break
+                                await page.wait_for_timeout(500)
 
-                            # If still not solved (interactive checkbox challenge), wait for widget to settle before screenshotting
-                            if not token_val:
+                            if auth_code:
+                                break
+
+                            # If still not solved and we are on an interactive Turnstile challenge:
+                            # CRITICAL: We must NOT take a screenshot while Turnstile is in "Verifying..." animation phase!
+                            # Wait until Turnstile actually displays the interactive checkbox.
+                            if not token_val and not (has_username and not await page.locator('#kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]').first.count() > 0):
+                                is_verifying = True
+                                checkbox_ready = False
+
+                                # Poll iframe state for up to 10 seconds to ensure interactive checkbox is rendered
+                                for _ in range(20):
+                                    token_val = await page.evaluate("""() => {
+                                        const el = document.querySelector('[name="cf-turnstile-response"]');
+                                        return el && el.value ? el.value : null;
+                                    }""")
+                                    if token_val:
+                                        break
+
+                                    for f in page.frames:
+                                        if "challenges.cloudflare.com" in f.url:
+                                            try:
+                                                content = await f.content()
+                                                is_verifying = "verifying" in content.lower()
+                                                has_cb = ('type="checkbox"' in content or 
+                                                          'ctp-checkbox' in content or 
+                                                          'human' in content.lower())
+                                                if has_cb and not is_verifying:
+                                                    checkbox_ready = True
+                                                    break
+                                            except Exception:
+                                                pass
+                                    if checkbox_ready or not is_verifying:
+                                        break
+                                    await page.wait_for_timeout(500)
+
+                                if token_val:
+                                    continue
+
+                                # Now capture the widget screenshot with the actual checkbox rendered
                                 try:
-                                    # Ensure widget has rendered dimensions
                                     for _ in range(10):
                                         box = await widget.bounding_box()
                                         if box and box["width"] >= 200 and box["height"] >= 40:
                                             break
                                         await page.wait_for_timeout(200)
 
-                                    # Short delay to allow checkbox element to paint
-                                    await page.wait_for_timeout(1000)
+                                    await page.wait_for_timeout(600)
                                     box = await widget.bounding_box()
                                     if box and box["width"] > 0 and box["height"] > 0:
                                         active_browser_sessions[session_id]["box"] = box
@@ -233,7 +311,7 @@ class DIUHeadlessScraper:
                                                 for f in page.frames:
                                                     if "challenges.cloudflare.com" in f.url:
                                                         try:
-                                                            cb = f.locator('input[type="checkbox"], label, .ctp-checkbox-label').first
+                                                            cb = f.locator('input[type="checkbox"], label, .ctp-checkbox-label, #challenge-stage').first
                                                             if await cb.count() > 0:
                                                                 await cb.click(timeout=1500)
                                                         except Exception:
@@ -258,12 +336,8 @@ class DIUHeadlessScraper:
                                         except asyncio.TimeoutError:
                                             yield {"type": "error", "message": "Verification timed out. Please try again."}
                                             return
-                                except Exception:
-                                    pass
-
-                        if has_turnstile and not token_val:
-                            # Keep waiting for Turnstile resolution; do not attempt credential entry yet
-                            continue
+                                except Exception as exc:
+                                    print(f"[TURNSTILE] Capture/click exception: {exc}")
 
                         # If on standalone Turnstile step and solved, click continue
                         continue_btn = page.locator('#kc-turnstile-submit, input[type="submit"][name="continue"]').first
@@ -294,7 +368,7 @@ class DIUHeadlessScraper:
                                 password_input = page.locator('#password').first
                                 if await password_input.count() > 0:
                                     await password_input.fill(password)
-                                await page.wait_for_timeout(1000)
+                                await page.wait_for_timeout(500)
 
                                 submit_btn = page.locator('#kc-login, button[type="submit"]').first
                                 if await submit_btn.count() > 0:
@@ -318,7 +392,9 @@ class DIUHeadlessScraper:
                             os.remove(lp)
                     except Exception:
                         pass
-            await queue_manager.release(queue_id)
+            if queue_id:
+                await queue_manager.release(queue_id)
+
 
         if not auth_code:
             yield {"type": "error", "message": "Invalid Student ID or Password. Please try again."}
