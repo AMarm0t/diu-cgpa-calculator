@@ -280,7 +280,7 @@ export default function Home() {
         throw new Error("Too many attempts. Please wait a minute and try again.");
       }
       if (response.status === 422) {
-        throw new Error("Please check your Student ID format (e.g. xxx-xx-xxx).");
+        throw new Error("Please check your Student ID format (xxx-xx-xxx).");
       }
       if (!response.ok || !response.body) {
         throw new Error("Unable to reach the calculation server. Please try again.");
