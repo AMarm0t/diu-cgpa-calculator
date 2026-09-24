@@ -30,9 +30,16 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 ## Part 2: Run the Backend
 
+The repository is **private**, so the VM downloads it with a read-only **deploy key**:
+```bash
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/github_deploy -C "diu-backend deploy key"
+printf "Host github.com\n  IdentityFile ~/.ssh/github_deploy\n  IdentitiesOnly yes\n" >> ~/.ssh/config
+cat ~/.ssh/github_deploy.pub   # add in GitHub: repo → Settings → Deploy keys → Add (leave "write" unticked)
+```
+
 ```bash
 sudo apt update && sudo apt install -y docker.io docker-compose-v2 git
-git clone <your-repo-url> && cd diu-cgpa-calculator
+git clone git@github.com:<you>/diu-cgpa-calculator.git && cd diu-cgpa-calculator
 nano .env   # fill in the values below
 sudo docker compose up -d --build
 ```
