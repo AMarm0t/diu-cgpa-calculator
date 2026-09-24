@@ -26,7 +26,7 @@ Built with **Camoufox** (stealth anti-detect browser), **FastAPI**, **Supabase**
 * **Frontend**: Next.js 14 (App Router), Tailwind CSS, Lucide Icons (`/frontend`)
 * **Backend**: FastAPI, Async Camoufox, Uvicorn (`/backend`)
 * **Database**: Supabase Cloud PostgreSQL with automatic local SQLite fallback (`/data`)
-* **Deployment**: Docker, Docker Compose, Oracle Cloud Always Free VM, Vercel
+* **Deployment**: Docker, Docker Compose, Azure VM (Azure for Students), Cloudflare Tunnel, Vercel
 
 ---
 
@@ -59,7 +59,7 @@ Frontend runs at `http://localhost:3000`.
 
 ## 🌐 Production Deployment
 
-Refer to [**`DEPLOY_ORACLE_CLOUD.md`**](./DEPLOY_ORACLE_CLOUD.md) for full instructions on hosting:
-* **Backend:** Oracle Cloud Always Free VM (12GB RAM, 100% Free Forever)
+Refer to [**`DEPLOY_AZURE.md`**](./DEPLOY_AZURE.md) for full instructions on hosting:
+* **Backend:** Azure VM (Azure for Students free size) behind a Cloudflare Tunnel
 * **Frontend:** Vercel (Next.js)
 * **Database:** Supabase Cloud

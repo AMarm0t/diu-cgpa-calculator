@@ -22,3 +22,6 @@ node_modules/
 Thumbs.db
 scratch/
 *.tsbuildinfo
+
+# Local research scripts & captured portal data (contain real credentials/PII - never commit)
+research/

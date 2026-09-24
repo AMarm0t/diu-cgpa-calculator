@@ -81,6 +81,77 @@ function ThemeToggle({ isDark, onToggle }: { isDark: boolean; onToggle: () => vo
   );
 }
 
+type LoginStep = "connect" | "verify" | "login" | "fetch";
+
+const LOGIN_STEPS: { key: LoginStep; label: string }[] = [
+  { key: "connect", label: "Connecting to portal" },
+  { key: "verify", label: "Security check" },
+  { key: "login", label: "Signing in" },
+  { key: "fetch", label: "Loading results" },
+];
+
+function LoginProgress({
+  step,
+  message,
+  queuePosition,
+  elapsed,
+  isDark,
+}: {
+  step: LoginStep;
+  message: string;
+  queuePosition: number | null;
+  elapsed: number;
+  isDark: boolean;
+}) {
+  const currentIndex = LOGIN_STEPS.findIndex((s) => s.key === step);
+  return (
+    <div
+      className={`rounded-lg border p-4 space-y-3 ${
+        isDark ? "bg-[#101010] border-[#2b2b2b]" : "bg-slate-50 border-slate-200"
+      }`}
+      aria-live="polite"
+    >
+      <ol className="space-y-2">
+        {LOGIN_STEPS.map((s, i) => {
+          const done = i < currentIndex;
+          const active = i === currentIndex;
+          return (
+            <li key={s.key} className="flex items-center space-x-2.5 text-sm">
+              {done ? (
+                <CheckCircle2 className={`w-4 h-4 flex-shrink-0 ${isDark ? "text-[#3ecf8e]" : "text-teal-600"}`} />
+              ) : active ? (
+                <Loader2 className={`w-4 h-4 flex-shrink-0 animate-spin ${isDark ? "text-[#3ecf8e]" : "text-teal-600"}`} />
+              ) : (
+                <span className={`w-4 h-4 flex-shrink-0 rounded-full border ${isDark ? "border-[#3a3a3a]" : "border-slate-300"}`} />
+              )}
+              <span
+                className={
+                  active
+                    ? isDark ? "text-white font-mono" : "text-slate-900 font-medium"
+                    : done
+                      ? isDark ? "text-[#888888] font-mono" : "text-slate-500"
+                      : isDark ? "text-[#555555] font-mono" : "text-slate-400"
+                }
+              >
+                {s.label}
+                {active && s.key === "connect" && queuePosition !== null && (
+                  <span className={isDark ? "text-amber-400" : "text-amber-600"}> · #{queuePosition} in line</span>
+                )}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+      <div className={`flex justify-between text-xs pt-2 border-t ${
+        isDark ? "border-[#222222] text-[#777777] font-mono" : "border-slate-200 text-slate-500"
+      }`}>
+        <span className="truncate pr-3">{message}</span>
+        <span className="tabular-nums flex-shrink-0">{elapsed}s</span>
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const [studentId, setStudentId] = useState("");
   const [password, setPassword] = useState("");
@@ -108,7 +179,18 @@ export default function Home() {
   
   const [isLoading, setIsLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("");
+  const [loginStep, setLoginStep] = useState<LoginStep>("connect");
+  const [queuePosition, setQueuePosition] = useState<number | null>(null);
+  const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!isLoading) return;
+    const startedAt = Date.now();
+    setElapsed(0);
+    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [isLoading]);
   const [isStreaming, setIsStreaming] = useState(false);
   
   const [challengeData, setChallengeData] = useState<ChallengeData | null>(null);
@@ -124,7 +206,7 @@ export default function Home() {
     if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
     clickTimeoutRef.current = setTimeout(() => {
       setIsClicking(false);
-    }, 8000);
+    }, 15000); // backend polls up to ~10s after a click before answering
 
     const rect = e.currentTarget.getBoundingClientRect();
     const scaleX = (challengeData.box.width || rect.width) / (rect.width || 1);
@@ -182,6 +264,8 @@ export default function Home() {
     setError("");
     setIsLoading(true);
     setLoadingMsg("Connecting to DIU Student Portal...");
+    setLoginStep("connect");
+    setQueuePosition(null);
     setChallengeData(null);
 
     try {
@@ -192,6 +276,12 @@ export default function Home() {
         body: JSON.stringify({ student_id: studentId.trim(), password: password.trim() }),
       });
 
+      if (response.status === 429) {
+        throw new Error("Too many attempts. Please wait a minute and try again.");
+      }
+      if (response.status === 422) {
+        throw new Error("Please check your Student ID format (e.g. xxx-xx-xxx).");
+      }
       if (!response.ok || !response.body) {
         throw new Error("Unable to reach the calculation server. Please try again.");
       }
@@ -217,7 +307,14 @@ export default function Home() {
           try {
             const payload = JSON.parse(trimmed.replace(/^data:\s*/, ""));
 
-            if (payload.type === "status" || payload.type === "queue") {
+            if (payload.type === "queue") {
+              setQueuePosition(payload.position ?? null);
+              setLoadingMsg(payload.message);
+            } else if (payload.type === "status") {
+              if (payload.step) {
+                setLoginStep(payload.step);
+                if (payload.step !== "connect") setQueuePosition(null);
+              }
               setLoadingMsg(payload.message);
             } else if (payload.type === "challenge_required") {
               if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
@@ -228,7 +325,9 @@ export default function Home() {
               });
               setIsClicking(false);
             } else if (payload.type === "challenge_retry") {
+              // The screenshot is stale; close the modal until the backend sends a fresh challenge_required
               if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+              setChallengeData(null);
               setIsClicking(false);
               setLoadingMsg(payload.message || "Please click the checkbox again.");
             } else if (payload.type === "challenge_solved") {
@@ -437,12 +536,22 @@ export default function Home() {
                   {isLoading ? (
                     <>
                       <Loader2 className={`w-5 h-5 mr-2 animate-spin ${isDark ? "text-black" : "text-white"}`} />
-                      <span>{loadingMsg}</span>
+                      <span>Please wait…</span>
                     </>
                   ) : (
                     "View Results"
                   )}
                 </button>
+
+                {isLoading && (
+                  <LoginProgress
+                    step={loginStep}
+                    message={loadingMsg}
+                    queuePosition={queuePosition}
+                    elapsed={elapsed}
+                    isDark={isDark}
+                  />
+                )}
               </form>
             </div>
           </div>

@@ -188,7 +188,7 @@ export default function AdminPage() {
   // When NextAuth session loads with an access token, verify it with backend
   useEffect(() => {
     if (status === "authenticated" && session) {
-      const authToken = (session as any).accessToken || (session as any).idToken;
+      const authToken = (session as any).idToken || (session as any).accessToken; // ID token carries our client ID as audience
       if (authToken && !token) {
         verifyAndSetToken(authToken);
       }

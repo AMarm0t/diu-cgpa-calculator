@@ -45,9 +45,6 @@ RUN python -m camoufox fetch
 # Copy backend code
 COPY backend /app/backend
 
-# Create persistent storage folder for browser profiles
-RUN mkdir -p /app/browser_profiles
-
 EXPOSE 8000
 
 # Start FastAPI application

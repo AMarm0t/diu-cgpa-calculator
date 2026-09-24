@@ -3,12 +3,13 @@ DIU CGPA Calculator - FastAPI Backend
 Provides API endpoint for the frontend to trigger portal scraping.
 """
 import asyncio
+import ipaddress
 import json
 import os
 import sys
+import time
+from collections import defaultdict, deque
 from pathlib import Path
-from contextlib import asynccontextmanager
-from datetime import datetime
 
 # Add current directory to sys.path for local module imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -17,54 +18,42 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import db
 from auth import verify_google_admin
 from queue_manager import queue_manager
 from scraper import DIUHeadlessScraper, dispatch_remote_click
+from browser_pool import browser_pool
 from cgpa_calculator import calculate_overall_cgpa
 
-# Request/Response models
+# Request models. Strict bounds keep junk out of the browser login, gateway URLs and the database.
 class ScrapeRequest(BaseModel):
-    student_id: str
-    password: str
+    student_id: str = Field(..., min_length=3, max_length=24, pattern=r"^\s*[A-Za-z0-9-]+\s*$")
+    password: str = Field(..., min_length=1, max_length=128)
 
 class CaptchaClickRequest(BaseModel):
-    session_id: str
-    x: float
-    y: float
+    session_id: str = Field(..., min_length=36, max_length=36)
+    x: float = Field(..., ge=0, le=10000)
+    y: float = Field(..., ge=0, le=10000)
 
-class StudentInfo(BaseModel):
-    id: str = ""
-    name: str = ""
-    department: str = ""
-    campus: str = ""
-    email: str = ""
+class ManualCourse(BaseModel):
+    code: str = Field("", max_length=32)
+    name: str = Field("", max_length=200)
+    credits: float = Field(0, ge=0, le=20)
+    grade: str = Field("", max_length=4)
+    grade_point: float = Field(0, ge=0, le=4)
 
-class CourseResult(BaseModel):
-    name: str = ""
-    code: str = ""
-    credits: float = 0
-    grade: str = ""
-    grade_point: float = 0
+class ManualSemester(BaseModel):
+    name: str = Field("", max_length=100)
+    gpa: float = Field(0, ge=0, le=4)
+    credits: float = Field(0, ge=0, le=100)
+    courses: list[ManualCourse] = Field(default_factory=list, max_length=40)
 
-class SemesterResult(BaseModel):
-    name: str = ""
-    gpa: float = 0
-    credits: float = 0
-    courses: list[CourseResult] = []
-
-class ScrapeResponse(BaseModel):
-    success: bool
-    error: str = ""
-    student: StudentInfo | None = None
-    overall_cgpa: float = 0
-    total_credits: float = 0
-    total_completed_credits: float = 0
-    semesters: list[SemesterResult] = []
+class ManualCgpaRequest(BaseModel):
+    semesters: list[ManualSemester] = Field(..., min_length=1, max_length=30)
 
 # FastAPI app
 app = FastAPI(
@@ -73,71 +62,70 @@ app = FastAPI(
     version="2.0.0",
 )
 
+# Only our own frontends may call the API from a browser. Override with a comma-separated list.
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,https://diu-cgpa-calculator-three.vercel.app",
+    ).split(",") if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+
+# --- Per-IP rate limiting (each login launches a whole browser, so floods are expensive) ---
+LOGIN_RATE_LIMIT = int(os.environ.get("LOGIN_RATE_LIMIT_PER_MIN", "6"))
+CLICK_RATE_LIMIT = 40
+_rate_windows: dict[tuple[str, str], deque] = defaultdict(deque)
+
+
+def client_ip(request: Request) -> str:
+    """
+    Real client IP. Behind a Cloudflare tunnel (or Docker's port mapping) requests arrive from a
+    loopback/private address, so proxy headers are trusted only then; a caller reaching us from
+    a public address could forge them.
+    """
+    peer = request.client.host if request.client else "unknown"
+    try:
+        addr = ipaddress.ip_address(peer)
+        via_local_proxy = addr.is_loopback or addr.is_private
+    except ValueError:
+        via_local_proxy = False
+    if via_local_proxy:
+        forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return peer
+
+
+def enforce_rate_limit(request: Request, bucket: str, limit_per_min: int):
+    now = time.monotonic()
+    window = _rate_windows[(bucket, client_ip(request))]
+    while window and now - window[0] > 60:
+        window.popleft()
+    if len(window) >= limit_per_min:
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute and try again.")
+    window.append(now)
+    if len(_rate_windows) > 20000:  # bound memory under a wide flood
+        for key in [k for k, w in _rate_windows.items() if not w or now - w[-1] > 60]:
+            del _rate_windows[key]
 
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "DIU CGPA Calculator API (Headless)"}
 
-@app.post("/api/scrape", response_model=ScrapeResponse)
-async def scrape_results(request: ScrapeRequest, authorization: Optional[str] = Header(None)):
-    if not request.student_id or not request.password:
-        raise HTTPException(status_code=400, detail="Student ID and password are required")
-    
-    # Check if public searches are currently enabled
-    settings = db.get_system_settings()
-    if not settings.get("public_search_enabled", True):
-        is_admin = False
-        if authorization and authorization.startswith("Bearer "):
-            admin_data = await verify_google_admin(authorization.split()[1])
-            if admin_data:
-                is_admin = True
-        if not is_admin:
-            return ScrapeResponse(
-                success=False,
-                error="Unable to connect to DIU Student Portal. Please try again later."
-            )
-    
-    scraper = DIUHeadlessScraper()
-    try:
-        result = await scraper.scrape(
-            student_id=request.student_id.strip(),
-            password=request.password.strip()
-        )
-        
-        if not result.get("success"):
-            return ScrapeResponse(
-                success=False,
-                error=result.get("error", "Login or scraping failed.")
-            )
-
-        return ScrapeResponse(
-            success=True,
-            student=StudentInfo(**result.get("student", {})),
-            overall_cgpa=result.get("overall_cgpa", 0.0),
-            total_credits=result.get("total_credits", 0.0),
-            total_completed_credits=result.get("total_completed_credits", 0.0),
-            semesters=result.get("semesters", [])
-        )
-    except Exception as e:
-        return ScrapeResponse(
-            success=False,
-            error=f"Error: {str(e)}"
-        )
-
 @app.post("/api/scrape-stream")
-async def scrape_stream_endpoint(request: ScrapeRequest, authorization: Optional[str] = Header(None)):
-    if not request.student_id or not request.password:
-        raise HTTPException(status_code=400, detail="Student ID and password are required")
-    
+async def scrape_stream_endpoint(request: ScrapeRequest, http_request: Request, authorization: Optional[str] = Header(None)):
+    enforce_rate_limit(http_request, "login", LOGIN_RATE_LIMIT)
+
     # Check if public searches are currently enabled
-    settings = db.get_system_settings()
+    settings = await asyncio.to_thread(db.get_system_settings)
     if not settings.get("public_search_enabled", True):
         is_admin = False
         if authorization and authorization.startswith("Bearer "):
@@ -167,7 +155,8 @@ async def scrape_stream_endpoint(request: ScrapeRequest, authorization: Optional
             async for item in scraper.scrape_stream(request.student_id.strip(), request.password.strip()):
                 yield f"data: {json.dumps(item)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            print(f"[STREAM] Unhandled scrape error: {e!r}")
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Something went wrong. Please try again.'})}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -179,7 +168,8 @@ async def scrape_stream_endpoint(request: ScrapeRequest, authorization: Optional
     )
 
 @app.post("/api/captcha-click")
-async def captcha_click_endpoint(req: CaptchaClickRequest):
+async def captcha_click_endpoint(req: CaptchaClickRequest, http_request: Request):
+    enforce_rate_limit(http_request, "click", CLICK_RATE_LIMIT)
     success = dispatch_remote_click(req.session_id, req.x, req.y)
     if not success:
         raise HTTPException(status_code=404, detail="Active browser session not found or timed out.")
@@ -187,17 +177,15 @@ async def captcha_click_endpoint(req: CaptchaClickRequest):
 
 
 @app.post("/api/calculate-cgpa")
-async def calculate_cgpa_manual(data: dict):
+async def calculate_cgpa_manual(data: ManualCgpaRequest):
     """
     Manually calculate CGPA from provided grade data.
     For users who want to enter their grades manually.
     """
-    semesters = data.get("semesters", [])
-    if not semesters:
-        raise HTTPException(status_code=400, detail="No semester data provided")
-    
-    result = calculate_overall_cgpa(semesters)
-    return result
+    try:
+        return calculate_overall_cgpa([sem.model_dump() for sem in data.semesters])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not calculate CGPA from the provided data")
 
 
 # ==========================================
@@ -207,6 +195,19 @@ async def calculate_cgpa_manual(data: dict):
 @app.on_event("startup")
 async def on_startup():
     db.init_db()
+    # Warm the shared browser in the background so the first login skips the ~7s Firefox launch
+    asyncio.create_task(browser_pool.start())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await browser_pool.stop()
+
+def valid_student_id(student_id: str) -> str:
+    sid = student_id.strip()
+    if not (3 <= len(sid) <= 24) or not all(c.isalnum() or c == "-" for c in sid):
+        raise HTTPException(status_code=400, detail="Invalid student ID")
+    return sid
+
 
 async def get_current_admin(authorization: str = Header(None)):
     if not authorization:
@@ -234,6 +235,7 @@ async def admin_list_students(admin: dict = Depends(get_current_admin)):
 @app.get("/api/admin/student/{student_id}")
 async def admin_get_student_detail(student_id: str, admin: dict = Depends(get_current_admin)):
     """Returns full academic transcript for a specific student without needing their password."""
+    student_id = valid_student_id(student_id)
     record = db.get_student(student_id)
     if not record:
         raise HTTPException(status_code=404, detail="Student record not found in database.")
@@ -244,12 +246,14 @@ async def admin_get_student_detail(student_id: str, admin: dict = Depends(get_cu
 @app.post("/api/admin/student/{student_id}/reset-cache")
 async def admin_reset_student_cache(student_id: str, admin: dict = Depends(get_current_admin)):
     """Expires the 1-hour cache timer for a student, forcing fresh scrape on next login."""
+    student_id = valid_student_id(student_id)
     success = db.reset_student_cache(student_id)
     return {"status": "ok", "message": f"Cache expired for {student_id}. Next login will scrape portal live."}
 
 @app.delete("/api/admin/student/{student_id}")
 async def admin_delete_student(student_id: str, admin: dict = Depends(get_current_admin)):
     """Permanently deletes student records and cached browser profile from database."""
+    student_id = valid_student_id(student_id)
     db.delete_student(student_id)
     return {"status": "ok", "message": f"Student {student_id} permanently removed from database."}
 
@@ -274,22 +278,13 @@ async def admin_update_settings(req: SettingsUpdateRequest, admin: dict = Depend
     db.update_system_settings(updates)
     return {"status": "ok", "settings": db.get_system_settings()}
 
-@app.post("/api/admin/scrape")
-async def admin_direct_scrape(req: ScrapeRequest, admin: dict = Depends(get_current_admin)):
-    """Admin-authenticated scrape tool that bypasses the public search kill switch."""
-    if not req.student_id or not req.password:
-        raise HTTPException(status_code=400, detail="Student ID and password are required")
-    scraper = DIUHeadlessScraper()
-    result = await scraper.scrape(student_id=req.student_id.strip(), password=req.password.strip())
-    return result
-
 class QueueRemoveRequest(BaseModel):
     id: str
 
 @app.get("/api/admin/queue")
 async def admin_get_queue(admin: dict = Depends(get_current_admin)):
     """Returns current live queue status, running scrapers, and waiting requests."""
-    return {"status": "ok", "queue": queue_manager.get_status()}
+    return {"status": "ok", "queue": {**queue_manager.get_status(), "browser": browser_pool.status()}}
 
 @app.post("/api/admin/queue/remove")
 async def admin_remove_queue(req: QueueRemoveRequest, admin: dict = Depends(get_current_admin)):

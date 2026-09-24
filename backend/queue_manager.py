@@ -3,13 +3,51 @@ Queue and Concurrency Manager for DIU CGPA Calculator Scraper
 Provides live queue observability, FIFO slot allocation, and administrative controls (remove/clear).
 """
 import asyncio
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 
+# Rough RAM cost of one login (a pooled Camoufox browser with the login page open), in MB.
+BROWSER_MB = int(os.getenv("BROWSER_MB", "280"))
+# RAM kept free for the OS, FastAPI, Docker and the warm spare browser, in MB.
+RESERVED_MB = int(os.getenv("RESERVED_MB", "350"))
+# Longest allowed waiting line. Beyond this, new requests are turned away instead of each holding
+# an open connection in memory (flood protection).
+MAX_WAITING = int(os.getenv("MAX_QUEUE_WAITING", "30"))
+
+
+def _meminfo_mb(field: str) -> Optional[int]:
+    """Reads a field (e.g. MemTotal, MemAvailable) from /proc/meminfo. Returns None off Linux."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return None
+
+
+def _default_limit() -> int:
+    """MAX_CONCURRENT_SCRAPES env var if set, otherwise sized from total RAM (1..10)."""
+    env = os.getenv("MAX_CONCURRENT_SCRAPES")
+    if env:
+        return max(1, int(env))
+    total = _meminfo_mb("MemTotal")
+    if total is None:
+        return 4
+    return max(1, min(10, (total - RESERVED_MB) // BROWSER_MB))
+
+
 class QueueCancelledException(Exception):
     """Raised when an enqueued or running scrape request is cancelled by an administrator."""
+    pass
+
+
+class QueueFullException(Exception):
+    """Raised when the waiting line is already at MAX_WAITING."""
     pass
 
 
@@ -33,8 +71,8 @@ class QueueItem:
 
 
 class QueueManager:
-    def __init__(self, limit: int = 1):
-        self.limit = limit
+    def __init__(self, limit: Optional[int] = None):
+        self.limit = limit or _default_limit()
         self._running: List[QueueItem] = []
         self._waiting: List[QueueItem] = []
         self._lock = asyncio.Lock()
@@ -50,6 +88,8 @@ class QueueManager:
         item = QueueItem(student_id)
 
         async with self._condition:
+            if len(self._waiting) >= MAX_WAITING:
+                raise QueueFullException("Too many requests are waiting.")
             self._waiting.append(item)
 
         try:
@@ -63,7 +103,7 @@ class QueueManager:
                         raise QueueCancelledException(f"Request for {student_id} was cancelled by administrator.")
 
                     # If a worker slot is free and this item is next in line
-                    if len(self._running) < self.limit and self._waiting and self._waiting[0] == item:
+                    if len(self._running) < self.limit and self._waiting and self._waiting[0] == item and self._has_memory_for_browser():
                         self._waiting.pop(0)
                         item.status = "running"
                         item.started_at = datetime.now(timezone.utc).isoformat()
@@ -89,11 +129,25 @@ class QueueManager:
                         await asyncio.wait_for(self._condition.wait(), timeout=1.0)
                 except asyncio.TimeoutError:
                     pass
-        except Exception:
-            async with self._condition:
-                if item in self._waiting:
-                    self._waiting.remove(item)
+        except BaseException:
+            # BaseException: client disconnects surface as CancelledError/GeneratorExit, and a
+            # waiting item left behind at the head of the line would block the queue forever.
+            # No await here (it may be re-cancelled); other waiters re-check every second anyway.
+            if item in self._waiting:
+                self._waiting.remove(item)
             raise
+
+    def _has_memory_for_browser(self) -> bool:
+        """
+        Admission control: only launch another browser if the machine actually has RAM for it.
+        The first browser is always allowed so a lone request can never deadlock.
+        """
+        if not self._running:
+            return True
+        available = _meminfo_mb("MemAvailable")
+        if available is None:
+            return True
+        return available - BROWSER_MB >= 150
 
     async def acquire(self, student_id: str) -> str:
         """
@@ -167,5 +221,7 @@ class QueueManager:
         }
 
 
-# Global singleton instance (limit=1 ensures 1GB RAM VM never thrashes swap with concurrent browsers)
-queue_manager = QueueManager(limit=1)
+# Global singleton instance. Limit is sized from RAM (override with MAX_CONCURRENT_SCRAPES);
+# each extra slot is additionally gated on live MemAvailable so browsers never push the VM into swap.
+queue_manager = QueueManager()
+print(f"[QUEUE] Max concurrent scrapes: {queue_manager.limit}")

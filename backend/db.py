@@ -18,7 +18,15 @@ load_dotenv()
 # Environment config
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-SECRET_SALT = os.environ.get("PASSWORD_SALT", "diu_cgpa_secure_salt_2026")
+# Optional server-side secret mixed into every password hash. Unlike the per-record salt it is
+# never stored in the database, so a leaked DB alone is not enough to start cracking hashes.
+PASSWORD_PEPPER = os.environ.get("PASSWORD_PEPPER", "")
+if not PASSWORD_PEPPER:
+    print("[DB] WARNING: PASSWORD_PEPPER is not set; password hashes rely on scrypt + salt only.")
+
+# scrypt cost (~16 MB, ~50 ms per hash): slow enough to make offline cracking of weak student
+# passwords impractical, cheap enough for a cache check.
+_SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 14, 8, 1
 
 SQLITE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "results_cache.db"))
 
@@ -35,15 +43,30 @@ def get_supabase():
             supabase_client = None
     return supabase_client
 
+def _scrypt(password: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(
+        (PASSWORD_PEPPER + password).encode(), salt=salt,
+        n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, maxmem=64 * 1024 * 1024, dklen=32,
+    )
+
 def hash_password(password: str) -> str:
-    """Hashes a student password with HMAC-SHA256 for secure local offline verification."""
-    return hmac.new(SECRET_SALT.encode(), password.encode(), hashlib.sha256).hexdigest()
+    """Hashes a student password with scrypt and a random per-record salt: 'scrypt$<salt>$<hash>'."""
+    salt = os.urandom(16)
+    return f"scrypt${salt.hex()}${_scrypt(password, salt).hex()}"
 
 def verify_password(password: str, stored_hash: str) -> bool:
-    """Verifies candidate password against stored hash in constant time."""
-    if not stored_hash:
+    """
+    Verifies a candidate password in constant time.
+    Legacy HMAC hashes (fast, with a publicly known default key) are never accepted; they simply
+    count as a cache miss, and the next successful live login stores a scrypt hash instead.
+    """
+    if not stored_hash or not stored_hash.startswith("scrypt$"):
         return False
-    return hmac.compare_digest(hash_password(password), stored_hash)
+    try:
+        _, salt_hex, hash_hex = stored_hash.split("$")
+        return hmac.compare_digest(_scrypt(password, bytes.fromhex(salt_hex)).hex(), hash_hex)
+    except (ValueError, TypeError):
+        return False
 
 def init_db():
     """Initializes local SQLite database if Supabase is not configured."""

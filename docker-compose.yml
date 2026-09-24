@@ -8,12 +8,12 @@ services:
     container_name: diu_cgpa_backend
     restart: always
     ports:
-      - "8000:8000"
+      # Loopback only: the Cloudflare Tunnel on this VM reaches it, the internet cannot (plain HTTP
+      # here would expose student passwords). Set BACKEND_BIND=0.0.0.0 only behind your own TLS proxy.
+      - "${BACKEND_BIND:-127.0.0.1}:8000:8000"
     env_file:
       - .env
     volumes:
-      # Persistent storage for browser profiles & cf_clearance cookies
-      - ./browser_profiles:/app/browser_profiles
       # Fallback database storage
       - ./data:/app/data
     environment:
