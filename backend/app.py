@@ -66,7 +66,8 @@ app = FastAPI(
 ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get(
         "ALLOWED_ORIGINS",
-        "http://localhost:3000,https://diu-cgpa-calculator-three.vercel.app",
+        "http://localhost:3000,https://www.resultscraper.app,https://resultscraper.app,"
+        "https://diu-cgpa-calculator-three.vercel.app",
     ).split(",") if o.strip()
 ]
 
@@ -306,4 +307,6 @@ if __name__ == "__main__":
     print("Starting DIU CGPA Calculator API...")
     print("Open http://localhost:8000 in your browser")
     print("Frontend should be running at http://localhost:3000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Loopback by default: the Cloudflare tunnel on the same machine reaches it, the network
+    # cannot (plain HTTP would expose student passwords). The Docker image sets HOST=0.0.0.0.
+    uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")))

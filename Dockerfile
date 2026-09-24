@@ -4,7 +4,8 @@ FROM python:3.12-slim
 # Prevent interactive prompts during apt install
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    HOST=0.0.0.0
 
 WORKDIR /app
 
@@ -37,7 +38,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy backend requirements
 COPY backend/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir "camoufox[geoip]"
 
 # Pre-fetch Camoufox browser binaries
 RUN python -m camoufox fetch
