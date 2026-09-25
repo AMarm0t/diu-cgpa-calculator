@@ -6,6 +6,7 @@ and interactive CAPTCHA relay when Cloudflare Turnstile requires user interactio
 import asyncio
 import os
 import base64
+import hashlib
 import uuid
 import time
 from datetime import datetime, timezone
@@ -273,19 +274,26 @@ class DIUHeadlessScraper:
                                     break
                                 if await widget.count() == 0:
                                     break  # page moved on without needing the widget
+                                t_step = time.monotonic()
                                 try:
                                     wbox = await widget.bounding_box()
+                                    t_box = time.monotonic() - t_step
                                     if wbox and wbox["width"] >= 200 and wbox["height"] >= 40:
                                         img = await widget.screenshot(timeout=10000)
                                         identical = identical + 1 if img == prev_img else 0
                                         prev_img = img
+                                        if TURNSTILE_DEBUG_DIR:
+                                            print(f"[TSDEBUG] {clean_id}: box {t_box:.1f}s shot {time.monotonic() - t_step - t_box:.1f}s hash {hashlib.md5(img).hexdigest()[:6]} identical={identical}")
                                         if identical >= 2:
                                             settled_img = img
                                             break
-                                except Exception:
+                                    elif TURNSTILE_DEBUG_DIR:
+                                        print(f"[TSDEBUG] {clean_id}: box {t_box:.1f}s unusable box={wbox}")
+                                except Exception as exc:
                                     # A slow/frozen browser (low-RAM server) times out a screenshot now and
                                     # then; keep the streak instead of resetting it, or it never settles.
-                                    pass
+                                    if TURNSTILE_DEBUG_DIR:
+                                        print(f"[TSDEBUG] {clean_id}: {type(exc).__name__} after {time.monotonic() - t_step:.1f}s: {str(exc).splitlines()[0][:120]}")
                                 await page.wait_for_timeout(300)
 
                             if auth_code:
