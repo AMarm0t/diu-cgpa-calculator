@@ -28,6 +28,10 @@ _lock = threading.Lock()
 def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
     conn = sqlite3.connect(HISTORY_PATH, timeout=5)
+    try:
+        os.chmod(HISTORY_PATH, 0o600)  # student IDs and visitor IPs: owner-only
+    except OSError:
+        pass
     conn.execute(
         """CREATE TABLE IF NOT EXISTS task_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
