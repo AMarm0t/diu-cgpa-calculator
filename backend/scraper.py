@@ -101,6 +101,18 @@ def _detach(fut: asyncio.Future):
     fut.add_done_callback(done)
 
 
+def request_leave(session_id: str, reason: str) -> str | None:
+    """
+    Marks a login as left by its page ("moved" to another server, or "left": tab closed) and returns
+    its student ID, so the caller can drop it from the line or stop it at once. None if unknown.
+    """
+    session = active_browser_sessions.get(session_id)
+    if not session:
+        return None
+    session["leave"] = reason
+    return session.get("student_id")
+
+
 def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
     """Dispatches remote user click coordinates to the corresponding headless browser session."""
     session = active_browser_sessions.get(session_id)
@@ -278,10 +290,24 @@ class DIUHeadlessScraper:
             "event": session_event,
             "click_coords": None,
             "box": None,
+            "student_id": clean_id,
+            "leave": None,  # "moved" / "left" once the page reports it left (see request_leave)
         }
+
+        def stopped_early() -> dict:
+            """The error event for a login stopped from outside: the visitor left or moved, or an admin."""
+            leave = active_browser_sessions.get(session_id, {}).get("leave")
+            if leave == "moved":
+                return {"type": "error", "code": "moved", "message": "Moved to another server."}
+            if leave:
+                return {"type": "error", "code": "abandoned", "message": "The visitor left."}
+            print(f"[LOGIN] {clean_id}: cancelled by administrator")
+            return {"type": "error", "code": "cancelled", "message": "This lookup was cancelled by an administrator."}
 
         code_event = asyncio.Event()
 
+        # The page's private handle for this login: captcha clicks and /api/leave use it
+        yield {"type": "ticket", "id": session_id}
         yield {"type": "status", "step": "connect", "message": "Connecting to DIU Student Portal..."}
 
         queue_id = None
@@ -295,8 +321,9 @@ class DIUHeadlessScraper:
                     break
             task["queue_wait_s"] = round(time.monotonic() - t_queued, 1)
         except QueueCancelledException:
+            event = stopped_early()
             active_browser_sessions.pop(session_id, None)
-            yield {"type": "error", "code": "cancelled", "message": "Scrape request was cancelled by administrator."}
+            yield event
             return
         except (QueueFullException, QueueTimeoutException):
             active_browser_sessions.pop(session_id, None)
@@ -377,8 +404,7 @@ class DIUHeadlessScraper:
                         if auth_code:
                             break
                         if queue_manager.is_cancelled(queue_id):
-                            print(f"[LOGIN] {clean_id}: cancelled by administrator")
-                            yield {"type": "error", "code": "cancelled", "message": "This lookup was cancelled by an administrator."}
+                            yield stopped_early()
                             return
                         if time.monotonic() > phase_deadline or time.monotonic() > hard_deadline:
                             print(f"[TURNSTILE] {clean_id}: gave up - no sign-in within the time limit")
@@ -509,8 +535,7 @@ class DIUHeadlessScraper:
                             if auth_code:
                                 break
                             if queue_manager.is_cancelled(queue_id):
-                                print(f"[LOGIN] {clean_id}: cancelled by administrator")
-                                yield {"type": "error", "code": "cancelled", "message": "This lookup was cancelled by an administrator."}
+                                yield stopped_early()
                                 return
                             if time.monotonic() > hard_deadline:
                                 print(f"[TURNSTILE] {clean_id}: gave up - browser phase over {MAX_BROWSER_PHASE_SECONDS}s")

@@ -120,8 +120,10 @@ async function pickServer(avoid?: string): Promise<string> {
   return up[0].base;
 }
 
-// While a login waits in line on one server: another server that has a free slot right now, if any.
-async function freeServerOtherThan(current: string): Promise<string | null> {
+// While a login waits at `position` in line on one server: another server where it would get further
+// ahead (a free slot = start now, or a shorter line), if any. Moving only to free servers let one
+// line grow while new arrivals kept the other server busy, so later arrivals were served first.
+async function betterServerThan(current: string, position: number): Promise<string | null> {
   const answers = await Promise.all(
     API_BASES.filter((b) => b !== current).map(async (base) => {
       const ctrl = new AbortController();
@@ -130,7 +132,9 @@ async function freeServerOtherThan(current: string): Promise<string | null> {
         const r = await fetch(`${base}/api/capacity`, { signal: ctrl.signal, cache: "no-store" });
         if (!r.ok) return null;
         const d = await r.json();
-        return Number(d.free_slots ?? 0) > 0 ? base : null;
+        // Place we'd have there: 0 = starts at once, otherwise behind everyone already waiting
+        const place = Number(d.free_slots ?? 0) > 0 ? 0 : Number(d.waiting ?? 999) + 1;
+        return { base, place };
       } catch {
         return null;
       } finally {
@@ -138,7 +142,22 @@ async function freeServerOtherThan(current: string): Promise<string | null> {
       }
     })
   );
-  return answers.find((b) => b !== null) ?? null;
+  const best = answers
+    .filter((a): a is { base: string; place: number } => a !== null && a.place < position)
+    .sort((a, b) => a.place - b.place)[0];
+  return best?.base ?? null;
+}
+
+// Tells a server this page left a login (moved to another server, or the tab is closing) so its
+// place in line is freed at once. sendBeacon is delivered even while the page unloads.
+function sendLeave(base: string, ticket: string, reason: "moved" | "left") {
+  const body = JSON.stringify({ ticket, reason });
+  try {
+    if (navigator.sendBeacon?.(`${base}/api/leave`, body)) return;
+  } catch {
+    // fall through to fetch
+  }
+  void fetch(`${base}/api/leave`, { method: "POST", body, keepalive: true }).catch(() => {});
 }
 
 // How many times one login may move to another server while waiting in line (stops ping-pong)
@@ -291,6 +310,16 @@ export default function Home() {
   const clickedRef = useRef(false);
   // The server chosen for the current login; the captcha click must go to the same one.
   const activeApiRef = useRef(API_BASE);
+  // The login in progress (its server and private ticket), so closing the tab can free its place
+  const liveLoginRef = useRef<{ base: string; ticket: string } | null>(null);
+  useEffect(() => {
+    const onPageHide = () => {
+      const live = liveLoginRef.current;
+      if (live) sendLeave(live.base, live.ticket, "left");
+    };
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
+  }, []);
 
   const [data, setData] = useState<StudentData | null>(null);
 
@@ -423,7 +452,8 @@ export default function Home() {
         if (opts.hopFrom && activeApiRef.current !== opts.hopFrom) {
           return { kind: "hop", to: opts.hopFrom, from: activeApiRef.current, last: true };
         }
-        throw new Error("Too many attempts. Please wait a minute and try again.");
+        const detail = await response.json().then((d) => d?.detail).catch(() => null);
+        throw new Error(typeof detail === "string" ? detail : "Too many attempts. Please wait a minute and try again.");
       }
       if (response.status === 422) {
         throw new Error("Please check your Student ID (digits and dashes only).");
@@ -443,12 +473,13 @@ export default function Home() {
         if (Date.now() - lastByteAt > STREAM_IDLE_LIMIT_MS) void reader.cancel().catch(() => {});
       }, 5000);
 
-      // While this login waits in line, keep checking the other servers and move to one that has a
-      // free slot. Logins that arrive in the same second all see the same server free and pick it;
-      // this spreads them out within a second or two. Checks are paced by place in line, so the
-      // front of the line moves first and the others see that slot taken instead of all jumping
-      // to it at once.
+      // While this login waits in line, keep checking the other servers and move to one where it
+      // would be further ahead (a free slot, or a shorter line). Logins that arrive in the same
+      // second all see the same server free and pick it; this spreads them out within seconds and
+      // keeps the lines even. Checks are paced by place in line, so the front of the line moves
+      // first and the others see that place taken instead of all jumping to it at once.
       const here = activeApiRef.current;
+      let ticket: string | null = null;
       let waiting = false;
       let linePosition = 1;
       const hopCheckDelay = (first: boolean) =>
@@ -460,23 +491,24 @@ export default function Home() {
         if (hopTimer) clearTimeout(hopTimer);
         hopTimer = null;
       };
-      const watchForFreeServer = (delayMs: number) => {
+      const watchForBetterServer = (delayMs: number) => {
         hopTimer = setTimeout(async () => {
           if (!waiting) return;
-          let free = await freeServerOtherThan(here);
-          if (free && linePosition > 1) {
-            // Someone ahead of us in line is probably moving to that slot too: give them time to
-            // take it, then look again, rather than both leaving and one of us queueing there.
+          let better = await betterServerThan(here, linePosition);
+          if (better && linePosition > 1) {
+            // Someone ahead of us in line is probably moving there too: give them time to take
+            // that place, then look again, rather than both leaving and one of us ending up behind.
             await new Promise((r) => setTimeout(r, (linePosition - 1) * 1500));
             if (!waiting) return;
-            free = await freeServerOtherThan(here);
+            better = await betterServerThan(here, linePosition);
           }
           if (!waiting) return; // our turn came meanwhile
-          if (free) {
-            hopTo = free;
-            void reader.cancel().catch(() => {}); // leaving the line; the server drops our place
+          if (better) {
+            hopTo = better;
+            if (ticket) sendLeave(here, ticket, "moved"); // frees our place here at once
+            void reader.cancel().catch(() => {});
           } else {
-            watchForFreeServer(hopCheckDelay(false));
+            watchForBetterServer(hopCheckDelay(false));
           }
         }, delayMs);
       };
@@ -498,13 +530,16 @@ export default function Home() {
             try {
               const payload = JSON.parse(trimmed.replace(/^data:\s*/, ""));
 
-              if (payload.type === "queue") {
+              if (payload.type === "ticket") {
+                ticket = String(payload.id);
+                liveLoginRef.current = { base: here, ticket };
+              } else if (payload.type === "queue") {
                 setQueuePosition(payload.position ?? null);
                 setLoadingMsg(payload.message);
                 linePosition = Math.max(1, Number(payload.position) || 1);
                 if (opts.allowHop && API_BASES.length > 1 && !waiting) {
                   waiting = true;
-                  watchForFreeServer(hopCheckDelay(true));
+                  watchForBetterServer(hopCheckDelay(true));
                 }
               } else if (payload.type === "status") {
                 stopHopWatch(); // out of the line: the login has started here
@@ -584,6 +619,7 @@ export default function Home() {
         }
       } finally {
         stopHopWatch();
+        liveLoginRef.current = null;
         clearInterval(idleCheck);
         void reader.cancel().catch(() => {});
       }

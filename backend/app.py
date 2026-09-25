@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 import db
 from auth import verify_google_admin
 from queue_manager import queue_manager
-from scraper import DIUHeadlessScraper, dispatch_remote_click
+from scraper import DIUHeadlessScraper, dispatch_remote_click, request_leave
 from browser_pool import browser_pool
 from cgpa_calculator import calculate_overall_cgpa
 import task_history
@@ -119,8 +119,13 @@ app.add_middleware(
 
 
 # --- Per-IP rate limiting (each login launches a whole browser, so floods are expensive) ---
-LOGIN_RATE_LIMIT = int(os.environ.get("LOGIN_RATE_LIMIT_PER_MIN", "6"))
-CLICK_RATE_LIMIT = 40
+# Limits. A whole campus can share one public IP, so per-IP limits only stop floods; password
+# guessing is limited per student ID instead (and every attempt needs a person to pass the captcha).
+LOGIN_RATE_LIMIT = int(os.environ.get("LOGIN_RATE_LIMIT_PER_MIN", "60"))         # per IP, per minute
+STUDENT_ATTEMPT_LIMIT = int(os.environ.get("STUDENT_ATTEMPT_LIMIT", "10"))        # per student ID...
+STUDENT_ATTEMPT_WINDOW = int(os.environ.get("STUDENT_ATTEMPT_WINDOW_S", "600"))   # ...per 10 minutes
+CLICK_RATE_LIMIT = 300                                                           # per IP, per minute
+LONGEST_LIMIT_WINDOW = max(60, STUDENT_ATTEMPT_WINDOW)
 _rate_windows: dict[tuple[str, str], deque] = defaultdict(deque)
 
 
@@ -143,17 +148,24 @@ def client_ip(request: Request) -> str:
     return peer
 
 
-def enforce_rate_limit(request: Request, bucket: str, limit_per_min: int):
+def _enforce_limit(bucket: str, key: str, limit: int, window_s: int, message: str):
+    """Sliding-window counter: at most `limit` hits per `window_s` seconds for (bucket, key)."""
     now = time.monotonic()
-    window = _rate_windows[(bucket, client_ip(request))]
-    while window and now - window[0] > 60:
+    window = _rate_windows[(bucket, key)]
+    while window and now - window[0] > window_s:
         window.popleft()
-    if len(window) >= limit_per_min:
-        raise HTTPException(status_code=429, detail="Too many requests. Please wait a minute and try again.")
+    if len(window) >= limit:
+        raise HTTPException(status_code=429, detail=message)
     window.append(now)
     if len(_rate_windows) > 20000:  # bound memory under a wide flood
-        for key in [k for k, w in _rate_windows.items() if not w or now - w[-1] > 60]:
-            del _rate_windows[key]
+        for k in [k for k, w in _rate_windows.items() if not w or now - w[-1] > LONGEST_LIMIT_WINDOW]:
+            del _rate_windows[k]
+
+
+def enforce_rate_limit(request: Request, bucket: str, limit_per_min: int):
+    """Per-IP flood guard. Students on campus Wi-Fi share one IP, so keep these generous."""
+    _enforce_limit(bucket, client_ip(request), limit_per_min, 60,
+                   "Too many requests from your network right now. Please try again in a minute.")
 
 @app.get("/")
 async def root():
@@ -185,6 +197,8 @@ async def capacity(http_request: Request):
 @app.post("/api/scrape-stream")
 async def scrape_stream_endpoint(request: ScrapeRequest, http_request: Request, authorization: Optional[str] = Header(None)):
     enforce_rate_limit(http_request, "login", LOGIN_RATE_LIMIT)
+    _enforce_limit("student", request.student_id.strip(), STUDENT_ATTEMPT_LIMIT, STUDENT_ATTEMPT_WINDOW,
+                   "Too many login attempts for this Student ID. Please wait a few minutes and try again.")
 
     # Check if public searches are currently enabled
     settings = await asyncio.to_thread(db.get_system_settings)
@@ -231,6 +245,26 @@ async def scrape_stream_endpoint(request: ScrapeRequest, http_request: Request, 
             "X-Accel-Buffering": "no"
         }
     )
+
+@app.post("/api/leave")
+async def leave_endpoint(http_request: Request):
+    """
+    The page reports that it left a login: moved to another server, or the tab was closed. Its place
+    in line (or its running slot) is freed at once instead of when a write to it fails, which through
+    Cloudflare takes ~15s. Sent with navigator.sendBeacon, so the JSON body arrives as text/plain:
+    {"ticket": <the login's ticket>, "reason": "moved" | "left"}.
+    """
+    enforce_rate_limit(http_request, "leave", 300)
+    try:
+        body = json.loads((await http_request.body()) or b"{}")
+        ticket = str(body.get("ticket", ""))[:64]
+        reason = "moved" if body.get("reason") == "moved" else "left"
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Bad request")
+    student_id = request_leave(ticket, reason)
+    if student_id:
+        await queue_manager.remove(student_id)
+    return {"ok": bool(student_id)}
 
 @app.post("/api/captcha-click")
 async def captcha_click_endpoint(req: CaptchaClickRequest, http_request: Request):

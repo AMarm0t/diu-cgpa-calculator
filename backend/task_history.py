@@ -15,7 +15,7 @@ MAX_ROWS = int(os.getenv("TASK_HISTORY_MAX_ROWS", "1000"))
 # Outcome codes shown in the admin panel
 RESULTS = (
     "success", "cached", "wrong_password", "timeout", "click_timeout", "stalled", "cancelled",
-    "abandoned", "busy", "duplicate", "network", "portal_error", "failed",
+    "abandoned", "moved", "busy", "duplicate", "network", "portal_error", "failed",
 )
 
 _COLUMNS = (

@@ -160,6 +160,7 @@ const TASK_RESULTS: Record<string, { label: string; cls: string }> = {
   stalled: { label: "Page froze", cls: "bg-orange-950/40 text-orange-300 border-orange-500/30" },
   cancelled: { label: "Cancelled", cls: "bg-[#1f1f1f] text-[#aaaaaa] border-[#333333]" },
   abandoned: { label: "User left", cls: "bg-[#1f1f1f] text-[#aaaaaa] border-[#333333]" },
+  moved: { label: "Moved server", cls: "bg-sky-950/40 text-sky-300 border-sky-500/30" },
   busy: { label: "Server busy", cls: "bg-purple-950/40 text-purple-300 border-purple-500/30" },
   duplicate: { label: "Duplicate", cls: "bg-[#1f1f1f] text-[#aaaaaa] border-[#333333]" },
   network: { label: "Network error", cls: "bg-red-950/40 text-red-300 border-red-500/30" },

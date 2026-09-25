@@ -17,7 +17,7 @@ RESERVED_MB = int(os.getenv("RESERVED_MB", "350"))
 # an open connection in memory (flood protection).
 MAX_WAITING = int(os.getenv("MAX_QUEUE_WAITING", "30"))
 # Longest time a request may wait in line before it is turned away as "server busy".
-MAX_QUEUE_WAIT_SECONDS = int(os.getenv("MAX_QUEUE_WAIT_SECONDS", "180"))
+MAX_QUEUE_WAIT_SECONDS = int(os.getenv("MAX_QUEUE_WAIT_SECONDS", "300"))
 
 
 def _meminfo_mb(field: str) -> Optional[int]:
