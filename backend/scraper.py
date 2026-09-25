@@ -35,13 +35,15 @@ _students_in_flight: set[str] = set()
 SEMESTER_FETCH_CONCURRENCY = 10
 
 # Max seconds from login page load to sign-in, excluding time spent waiting for the user's click
-SECURITY_CHECK_TIMEOUT = 120
+SECURITY_CHECK_TIMEOUT = 90
 
-# Seconds the user has to click once the live view of the security check is on screen
-CLICK_TIMEOUT = 90
+# Seconds the user has to click once the live view of the security check is on screen. Most click
+# within 5-10s; someone who walked away would otherwise hold one of the few slots.
+CLICK_TIMEOUT = 60
 
-# Hard cap on the whole browser phase (security check + sign-in), whatever else happens
-MAX_BROWSER_PHASE_SECONDS = 240
+# Hard cap on the whole browser phase (browser start -> signed in), whatever else happens. A normal
+# login takes ~40s; each server runs only one or two at a time, so a stuck one must not hold its slot.
+MAX_BROWSER_PHASE_SECONDS = 120
 
 # Seconds of stream silence before a keep-alive comment is sent. Short, because a visitor who left
 # (or moved to the other server) is only noticed when a write to them fails; until then they hold
