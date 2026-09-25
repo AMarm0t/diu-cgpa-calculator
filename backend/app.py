@@ -20,7 +20,7 @@ load_dotenv()
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import db
 from auth import verify_google_admin
@@ -28,11 +28,14 @@ from queue_manager import queue_manager
 from scraper import DIUHeadlessScraper, dispatch_remote_click
 from browser_pool import browser_pool
 from cgpa_calculator import calculate_overall_cgpa
+import task_history
 
 # Request models. Strict bounds keep junk out of the browser login, gateway URLs and the database.
 class ScrapeRequest(BaseModel):
-    student_id: str = Field(..., min_length=3, max_length=24, pattern=r"^\s*[A-Za-z0-9-]+\s*$")
-    password: str = Field(..., min_length=1, max_length=128)
+    # DIU student IDs look like xxx-xx-xxx: digits in three dash-separated groups
+    student_id: str = Field(..., min_length=6, max_length=20, pattern=r"^\s*\d{2,4}-\d{2,3}-\d{2,6}\s*$")
+    # Any printable characters (real passwords use symbols), but bounded and no control characters
+    password: str = Field(..., min_length=1, max_length=64, pattern=r"^[^\x00-\x1f\x7f]+$")
 
 class CaptchaClickRequest(BaseModel):
     session_id: str = Field(..., min_length=36, max_length=36)
@@ -56,11 +59,40 @@ class ManualCgpaRequest(BaseModel):
     semesters: list[ManualSemester] = Field(..., min_length=1, max_length=30)
 
 # FastAPI app
+# Interactive API docs (/docs, /redoc, /openapi.json) map every endpoint for an attacker;
+# they are only served when ENABLE_API_DOCS=1 (local development).
+_docs = os.environ.get("ENABLE_API_DOCS") == "1"
 app = FastAPI(
     title="DIU CGPA Calculator",
     description="Headless Scraper & CGPA Calculator for DIU",
     version="2.0.0",
+    docs_url="/docs" if _docs else None,
+    redoc_url="/redoc" if _docs else None,
+    openapi_url="/openapi.json" if _docs else None,
 )
+
+# Every request body here is a few hundred bytes; refuse anything larger before reading it.
+MAX_BODY_BYTES = 8 * 1024
+
+
+@app.middleware("http")
+async def limit_body_and_harden(request: Request, call_next):
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        length = request.headers.get("content-length")
+        if length is None and request.headers.get("transfer-encoding"):
+            return JSONResponse({"detail": "Request body must declare its length."}, status_code=411)
+        try:
+            if length is not None and int(length) > MAX_BODY_BYTES:
+                return JSONResponse({"detail": "Request body too large."}, status_code=413)
+        except ValueError:
+            return JSONResponse({"detail": "Invalid Content-Length."}, status_code=400)
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if request.url.path.startswith("/api/"):
+        # Results and admin data are personal: never let browsers or proxies cache them
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 # Only our own frontends may call the API from a browser. Override with a comma-separated list.
 ALLOWED_ORIGINS = [
@@ -153,7 +185,7 @@ async def scrape_stream_endpoint(request: ScrapeRequest, http_request: Request, 
         # to immediately dispatch stream chunks without buffering.
         yield f": {' ' * 2048}\n\n"
         try:
-            async for item in scraper.scrape_stream(request.student_id.strip(), request.password.strip()):
+            async for item in scraper.scrape_stream(request.student_id.strip(), request.password.strip(), client_ip(http_request)):
                 yield f"data: {json.dumps(item)}\n\n"
         except Exception as e:
             print(f"[STREAM] Unhandled scrape error: {e!r}")
@@ -259,7 +291,7 @@ async def admin_delete_student(student_id: str, admin: dict = Depends(get_curren
     return {"status": "ok", "message": f"Student {student_id} permanently removed from database."}
 
 class SettingsUpdateRequest(BaseModel):
-    cache_ttl_minutes: Optional[int] = None
+    cache_ttl_minutes: Optional[int] = Field(None, ge=1, le=10080)  # up to one week
     public_search_enabled: Optional[bool] = None
 
 @app.get("/api/admin/settings")
@@ -278,6 +310,16 @@ async def admin_update_settings(req: SettingsUpdateRequest, admin: dict = Depend
         updates["public_search_enabled"] = req.public_search_enabled
     db.update_system_settings(updates)
     return {"status": "ok", "settings": db.get_system_settings()}
+
+@app.get("/api/admin/history")
+async def admin_task_history(limit: int = 100, result: Optional[str] = None, admin: dict = Depends(get_current_admin)):
+    """Recent lookups with their outcome (newest first). result= one outcome code or 'failures'."""
+    if result is not None and result not in task_history.RESULTS and result != "failures":
+        raise HTTPException(status_code=400, detail="Unknown result filter")
+    tasks = await asyncio.to_thread(task_history.recent, limit, result)
+    counts = await asyncio.to_thread(task_history.summary)
+    return {"status": "ok", "tasks": tasks, "counts": counts}
+
 
 class QueueRemoveRequest(BaseModel):
     id: str

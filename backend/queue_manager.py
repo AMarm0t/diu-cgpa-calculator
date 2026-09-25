@@ -16,6 +16,8 @@ RESERVED_MB = int(os.getenv("RESERVED_MB", "350"))
 # Longest allowed waiting line. Beyond this, new requests are turned away instead of each holding
 # an open connection in memory (flood protection).
 MAX_WAITING = int(os.getenv("MAX_QUEUE_WAITING", "30"))
+# Longest time a request may wait in line before it is turned away as "server busy".
+MAX_QUEUE_WAIT_SECONDS = int(os.getenv("MAX_QUEUE_WAIT_SECONDS", "180"))
 
 
 def _meminfo_mb(field: str) -> Optional[int]:
@@ -51,11 +53,16 @@ class QueueFullException(Exception):
     pass
 
 
+class QueueTimeoutException(Exception):
+    """Raised when a request waited longer than MAX_QUEUE_WAIT_SECONDS for a slot."""
+    pass
+
+
 class QueueItem:
     def __init__(self, student_id: str):
         self.queue_id = f"qid_{uuid.uuid4().hex[:10]}"
         self.student_id = student_id.strip()
-        self.status = "waiting"  # "waiting" | "running" | "cancelled" | "completed"
+        self.status = "waiting"  # "waiting" | "running" | "cancelling" | "cancelled"
         self.queued_at = datetime.now(timezone.utc).isoformat()
         self.started_at: Optional[str] = None
         self.cancel_event = asyncio.Event()
@@ -94,7 +101,10 @@ class QueueManager:
 
         try:
             last_reported_pos = None
+            wait_deadline = asyncio.get_running_loop().time() + MAX_QUEUE_WAIT_SECONDS
             while True:
+                if asyncio.get_running_loop().time() > wait_deadline:
+                    raise QueueTimeoutException(f"Waited more than {MAX_QUEUE_WAIT_SECONDS}s for a slot.")
                 async with self._condition:
                     # Check if this item was cancelled
                     if item.cancel_event.is_set():
@@ -149,6 +159,10 @@ class QueueManager:
             return True
         return available - BROWSER_MB >= 150
 
+    def is_cancelled(self, queue_id: Optional[str]) -> bool:
+        """True once an administrator cancelled this running task (the scraper polls this)."""
+        return any(item.queue_id == queue_id and item.cancel_event.is_set() for item in self._running)
+
     async def acquire(self, student_id: str) -> str:
         """
         Enqueues a scrape request synchronously. Suspends coroutine until a worker slot is available.
@@ -184,12 +198,13 @@ class QueueManager:
                     self._waiting.remove(item)
                     found = True
 
-            # Check running list
-            for item in list(self._running):
-                if item.queue_id == clean_id or item.student_id == clean_id:
-                    item.status = "cancelled"
+            # Running tasks are only flagged: the scraper sees the flag, stops its browser and then
+            # releases the slot itself. Removing them here would free the slot while the browser
+            # still runs, letting a second browser start on a small server.
+            for item in self._running:
+                if (item.queue_id == clean_id or item.student_id == clean_id) and not item.cancel_event.is_set():
+                    item.status = "cancelling"
                     item.cancel_event.set()
-                    self._running.remove(item)
                     found = True
 
             if found:

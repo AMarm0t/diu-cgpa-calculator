@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { signIn, signOut, useSession } from "next-auth/react";
 import Link from "next/link";
 import { 
@@ -94,7 +94,7 @@ interface StudentDetailRecord {
 interface QueueItemRecord {
   queue_id: string;
   student_id: string;
-  status: "waiting" | "running";
+  status: "waiting" | "running" | "cancelling" | "cancelled";
   queued_at: string;
   started_at?: string | null;
 }
@@ -105,7 +105,41 @@ interface QueueStatusRecord {
   waiting_count: number;
   running: QueueItemRecord[];
   waiting: QueueItemRecord[];
+  browser?: { warm_spares: number; in_use: number; launching: number; waiting_for_browser: number };
 }
+
+interface TaskRecord {
+  task_id: string;
+  student_id: string;
+  client_ip: string | null;
+  source: "live" | "cache";
+  result: string;
+  stage: string | null;
+  message: string | null;
+  captcha_shown: number;
+  clicks: number;
+  semesters: number;
+  queue_wait_s: number | null;
+  duration_s: number | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+// Label + colour for each task outcome recorded by the backend
+const TASK_RESULTS: Record<string, { label: string; cls: string }> = {
+  success: { label: "Success", cls: "bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30" },
+  cached: { label: "Cached", cls: "bg-sky-950/40 text-sky-300 border-sky-500/30" },
+  wrong_password: { label: "Wrong password", cls: "bg-amber-950/40 text-amber-300 border-amber-500/30" },
+  timeout: { label: "Timed out", cls: "bg-orange-950/40 text-orange-300 border-orange-500/30" },
+  click_timeout: { label: "No click", cls: "bg-orange-950/40 text-orange-300 border-orange-500/30" },
+  cancelled: { label: "Cancelled", cls: "bg-[#1f1f1f] text-[#aaaaaa] border-[#333333]" },
+  abandoned: { label: "User left", cls: "bg-[#1f1f1f] text-[#aaaaaa] border-[#333333]" },
+  busy: { label: "Server busy", cls: "bg-purple-950/40 text-purple-300 border-purple-500/30" },
+  duplicate: { label: "Duplicate", cls: "bg-[#1f1f1f] text-[#aaaaaa] border-[#333333]" },
+  network: { label: "Network error", cls: "bg-red-950/40 text-red-300 border-red-500/30" },
+  portal_error: { label: "Portal error", cls: "bg-red-950/40 text-red-300 border-red-500/30" },
+  failed: { label: "Failed", cls: "bg-red-950/40 text-red-300 border-red-500/30" },
+};
 
 export default function AdminPage() {
   const { data: session, status } = useSession();
@@ -155,6 +189,13 @@ export default function AdminPage() {
     box: { x: number; y: number; width: number; height: number };
   } | null>(null);
   const [isClickingChallenge, setIsClickingChallenge] = useState<boolean>(false);
+  // Ref (not state) so the SSE loop's closure sees it: once the admin clicked, late frames must not reopen the popup
+  const adminClickedRef = useRef(false);
+
+  // Task history (queue tab)
+  const [history, setHistory] = useState<TaskRecord[]>([]);
+  const [historyCounts, setHistoryCounts] = useState<Record<string, number>>({});
+  const [historyFilter, setHistoryFilter] = useState<string>("all");
 
   const showToast = (text: string, type: "success" | "error" = "success") => {
     setToastMessage({ text, type });
@@ -279,6 +320,24 @@ export default function AdminPage() {
     }
   }, [token]);
 
+  // Fetch recent task history with outcomes
+  const fetchHistory = useCallback(async () => {
+    if (!token) return;
+    try {
+      const qs = historyFilter === "all" ? "" : `&result=${encodeURIComponent(historyFilter)}`;
+      const res = await fetch(`${API_BASE}/api/admin/history?limit=100${qs}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setHistory(data.tasks || []);
+        setHistoryCounts(data.counts || {});
+      }
+    } catch (err) {
+      console.error("Failed to load task history:", err);
+    }
+  }, [token, historyFilter]);
+
   // Remove individual student from queue
   const handleRemoveFromQueue = async (id: string) => {
     if (!token || isActionQueueLoading) return;
@@ -334,7 +393,8 @@ export default function AdminPage() {
 
   // Forward admin click coordinates to backend to solve Cloudflare Turnstile
   const handleChallengeClick = async (e: React.MouseEvent<HTMLImageElement>) => {
-    if (!challengeData || isClickingChallenge) return;
+    if (!challengeData || isClickingChallenge || adminClickedRef.current) return;
+    adminClickedRef.current = true;
     setIsClickingChallenge(true);
 
     const rect = e.currentTarget.getBoundingClientRect();
@@ -347,13 +407,14 @@ export default function AdminPage() {
     let clickX = (challengeData.box.x || 0) + relX;
     let clickY = (challengeData.box.y || 0) + relY;
 
+    // Turnstile's checkbox centre inside the 300x65 widget (same as the public page)
     if (relX < 210 && relY < 70) {
-      clickX = (challengeData.box.x || 0) + 28;
-      clickY = (challengeData.box.y || 0) + 32;
+      clickX = (challengeData.box.x || 0) + 21;
+      clickY = (challengeData.box.y || 0) + 33;
     }
 
     try {
-      await fetch(`${API_BASE}/api/captcha-click`, {
+      const res = await fetch(`${API_BASE}/api/captcha-click`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -362,8 +423,13 @@ export default function AdminPage() {
           y: clickY
         })
       });
+      if (!res.ok) throw new Error(`click not accepted (${res.status})`);
+      // Close right away; a challenge_retry reopens it with a fresh checkbox if needed
+      setChallengeData(null);
+      setScrapeProgressMsg("Checking your verification...");
     } catch (err) {
       console.error("Failed to forward captcha click:", err);
+      adminClickedRef.current = false;
       setIsClickingChallenge(false);
     }
   };
@@ -378,6 +444,7 @@ export default function AdminPage() {
     setScrapeError("");
     setIsScrapingAdmin(true);
     setScrapeProgressMsg("Connecting to DIU Student Portal...");
+    adminClickedRef.current = false;
     setChallengeData(null);
 
     try {
@@ -393,6 +460,12 @@ export default function AdminPage() {
         })
       });
 
+      if (response.status === 429) {
+        throw new Error("Too many attempts. Please wait a minute and try again.");
+      }
+      if (response.status === 422) {
+        throw new Error("Check the Student ID format (xxx-xx-xxx) and password length (max 64).");
+      }
       if (!response.ok || !response.body) {
         throw new Error("Unable to communicate with scraping server.");
       }
@@ -416,16 +489,24 @@ export default function AdminPage() {
           try {
             const payload = JSON.parse(trimmed.replace(/^data:\s*/, ""));
 
-            if (payload.type === "status") {
-              setScrapeProgressMsg(payload.message);
+            if (payload.type === "status" || payload.type === "queue") {
+              if (payload.message) setScrapeProgressMsg(payload.message);
             } else if (payload.type === "challenge_required") {
-              setChallengeData({
-                sessionId: payload.session_id,
-                image: payload.image,
-                box: payload.box || { x: 0, y: 0, width: 300, height: 65 }
-              });
+              if (!adminClickedRef.current) {
+                setChallengeData({
+                  sessionId: payload.session_id,
+                  image: payload.image,
+                  box: payload.box || { x: 0, y: 0, width: 300, height: 65 }
+                });
+                setIsClickingChallenge(false);
+              }
+            } else if (payload.type === "challenge_retry") {
+              adminClickedRef.current = false;
+              setChallengeData(null);
               setIsClickingChallenge(false);
+              setScrapeProgressMsg(payload.message || "Verification still pending...");
             } else if (payload.type === "challenge_solved") {
+              adminClickedRef.current = false;
               setChallengeData(null);
               setIsClickingChallenge(false);
               setScrapeProgressMsg("Verification passed! Logging in...");
@@ -448,8 +529,11 @@ export default function AdminPage() {
     } catch (err: any) {
       setScrapeError(err?.message || "Failed to communicate with scraping backend.");
     } finally {
+      adminClickedRef.current = false;
       setIsScrapingAdmin(false);
+      setIsClickingChallenge(false);
       setChallengeData(null);
+      fetchHistory();
     }
   };
 
@@ -465,10 +549,15 @@ export default function AdminPage() {
   useEffect(() => {
     if (activeTab === "queue" && token) {
       fetchQueue();
+      fetchHistory();
       const interval = setInterval(fetchQueue, 3000);
-      return () => clearInterval(interval);
+      const historyInterval = setInterval(fetchHistory, 10000);
+      return () => {
+        clearInterval(interval);
+        clearInterval(historyInterval);
+      };
     }
-  }, [activeTab, token, fetchQueue]);
+  }, [activeTab, token, fetchQueue, fetchHistory]);
 
   const handleGoogleSignIn = () => {
     setAuthError("");
@@ -1058,6 +1147,7 @@ export default function AdminPage() {
                       <input
                         type="text"
                         placeholder="xxx-xx-xxx"
+                        maxLength={20}
                         value={scrapeStudentId}
                         onChange={(e) => setScrapeStudentId(e.target.value)}
                         disabled={isScrapingAdmin}
@@ -1071,6 +1161,7 @@ export default function AdminPage() {
                       <input
                         type="password"
                         placeholder="Portal Password"
+                        maxLength={64}
                         value={scrapePassword}
                         onChange={(e) => setScrapePassword(e.target.value)}
                         disabled={isScrapingAdmin}
@@ -1149,12 +1240,12 @@ export default function AdminPage() {
                         {queueData?.active_count || 0}
                       </span>
                       <span className="text-xs font-mono text-[#666666]">
-                        / {queueData?.limit || 4} slots
+                        / {queueData?.limit ?? "-"} slots
                       </span>
                     </div>
                     {/* Visual worker slots */}
                     <div className="flex items-center space-x-1.5 mt-3">
-                      {Array.from({ length: queueData?.limit || 4 }).map((_, i) => (
+                      {Array.from({ length: queueData?.limit || 1 }).map((_, i) => (
                         <div
                           key={i}
                           className={`h-2 flex-1 rounded-sm transition-all ${
@@ -1188,10 +1279,12 @@ export default function AdminPage() {
                       <ShieldCheck className="w-3.5 h-3.5 text-[#3ecf8e]" />
                     </div>
                     <div className="text-2xl font-bold font-mono text-[#3ecf8e]">
-                      {queueData?.limit || 4} Max
+                      {queueData?.limit ?? "-"} Max
                     </div>
                     <p className="text-[11px] text-[#666666] font-mono mt-2">
-                      Backed by 4GB SSD virtual swap memory
+                      {queueData?.browser
+                        ? `Browsers: ${queueData.browser.in_use} in use, ${queueData.browser.warm_spares} ready, ${queueData.browser.launching} starting`
+                        : "New logins start only when RAM is free"}
                     </p>
                   </div>
                 </div>
@@ -1223,10 +1316,17 @@ export default function AdminPage() {
                                 {item.student_id}
                               </td>
                               <td className="px-4 py-3">
-                                <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-mono bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/30">
-                                  <Loader2 className="w-3 h-3 mr-1 animate-spin" />
-                                  Running
-                                </span>
+                                {item.status === "cancelling" ? (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-mono bg-red-950/40 text-red-300 border border-red-500/30">
+                                    <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                                    Cancelling
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-mono bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/30">
+                                    <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                                    Running
+                                  </span>
+                                )}
                               </td>
                               <td className="px-4 py-3 text-[#888888]">
                                 {item.started_at ? new Date(item.started_at).toLocaleTimeString() : "-"}
@@ -1235,7 +1335,7 @@ export default function AdminPage() {
                                 <button
                                   type="button"
                                   onClick={() => handleRemoveFromQueue(item.queue_id)}
-                                  disabled={isActionQueueLoading}
+                                  disabled={isActionQueueLoading || item.status === "cancelling"}
                                   className="px-2.5 py-1 rounded bg-red-950/40 hover:bg-red-900/60 border border-red-500/30 text-red-300 hover:text-red-200 text-xs transition-colors cursor-pointer disabled:opacity-50"
                                 >
                                   Cancel Scrape
@@ -1312,6 +1412,82 @@ export default function AdminPage() {
                     </div>
                   )}
                 </div>
+
+                {/* Section 3: Task history */}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <h4 className="text-xs font-mono font-semibold text-[#888888] uppercase tracking-wider flex items-center gap-2">
+                      <Clock className="w-3.5 h-3.5 text-[#888888]" />
+                      Task History (last {history.length})
+                    </h4>
+                    <select
+                      value={historyFilter}
+                      onChange={(e) => setHistoryFilter(e.target.value)}
+                      className="bg-[#111111] border border-[#2b2b2b] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-[#3ecf8e]"
+                    >
+                      <option value="all">All results</option>
+                      <option value="failures">Failures only</option>
+                      {Object.entries(TASK_RESULTS).map(([key, meta]) => (
+                        <option key={key} value={key}>
+                          {meta.label}{historyCounts[key] ? ` (${historyCounts[key]})` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {history.length > 0 ? (
+                    <div className="bg-[#161616] border border-[#242424] rounded-lg overflow-x-auto">
+                      <table className="w-full text-left text-xs font-mono">
+                        <thead className="bg-[#1b1b1b] border-b border-[#242424] text-[10px] text-[#888888] uppercase">
+                          <tr>
+                            <th className="px-4 py-2.5">Time</th>
+                            <th className="px-4 py-2.5">Student ID</th>
+                            <th className="px-4 py-2.5">Result</th>
+                            <th className="px-4 py-2.5">Duration</th>
+                            <th className="px-4 py-2.5">Reached</th>
+                            <th className="px-4 py-2.5">Captcha</th>
+                            <th className="px-4 py-2.5">Details</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#222222]">
+                          {history.map((t) => {
+                            const meta = TASK_RESULTS[t.result] || TASK_RESULTS.failed;
+                            return (
+                              <tr key={t.task_id} className="hover:bg-[#1a1a1a] align-top">
+                                <td className="px-4 py-3 text-[#888888] whitespace-nowrap">
+                                  {new Date(t.started_at).toLocaleString()}
+                                </td>
+                                <td className="px-4 py-3 font-semibold text-white whitespace-nowrap">{t.student_id}</td>
+                                <td className="px-4 py-3">
+                                  <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] border whitespace-nowrap ${meta.cls}`}>
+                                    {meta.label}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-3 text-[#cccccc] whitespace-nowrap">
+                                  {t.duration_s != null ? `${t.duration_s}s` : "-"}
+                                  {t.queue_wait_s ? <span className="text-[#666666]"> (queued {t.queue_wait_s}s)</span> : null}
+                                </td>
+                                <td className="px-4 py-3 text-[#888888]">{t.stage || "-"}</td>
+                                <td className="px-4 py-3 text-[#888888] whitespace-nowrap">
+                                  {t.captcha_shown ? `shown, ${t.clicks} click${t.clicks === 1 ? "" : "s"}` : "-"}
+                                </td>
+                                <td className="px-4 py-3 text-[#888888] max-w-[260px] break-words">
+                                  {t.result === "success" || t.result === "cached"
+                                    ? `${t.semesters} semester${t.semesters === 1 ? "" : "s"}`
+                                    : t.message || "-"}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="bg-[#161616] border border-[#242424] rounded-lg p-6 text-center text-xs text-[#666666] font-mono">
+                      No lookups recorded yet{historyFilter !== "all" ? " for this filter" : ""}.
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -1328,7 +1504,7 @@ export default function AdminPage() {
               <div>
                 <h3 className="text-sm font-bold text-white">Security Verification</h3>
                 <p className="text-xs text-[#888888] mt-1">
-                  Cloudflare requires verification. Click the box below to complete:
+                  Click the checkbox below to continue:
                 </p>
               </div>
 
@@ -1343,7 +1519,7 @@ export default function AdminPage() {
                 {isClickingChallenge && (
                   <div className="absolute inset-0 bg-black/70 backdrop-blur-[1px] flex items-center justify-center space-x-2 text-[#3ecf8e] text-xs font-mono">
                     <Loader2 className="w-4 h-4 animate-spin text-[#3ecf8e]" />
-                    <span>Dispatching click...</span>
+                    <span>Sending click...</span>
                   </div>
                 )}
               </div>

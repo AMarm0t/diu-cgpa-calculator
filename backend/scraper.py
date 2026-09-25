@@ -16,7 +16,8 @@ import httpx
 from PIL import Image
 import db
 from browser_pool import browser_pool, WARM_BROWSERS
-from queue_manager import queue_manager, QueueCancelledException, QueueFullException
+from queue_manager import queue_manager, QueueCancelledException, QueueFullException, QueueTimeoutException
+import task_history
 from cgpa_calculator import calculate_overall_cgpa
 
 LOGIN_URL = "https://auth1.diu.edu.bd/realms/diu-student/protocol/openid-connect/auth?client_id=student-portal-ui&redirect_uri=https%3A%2F%2Fstudentportal.diu.edu.bd%2F&response_type=code&scope=openid+profile+email"
@@ -38,6 +39,9 @@ SECURITY_CHECK_TIMEOUT = 120
 
 # Seconds the user has to click once the live view of the security check is on screen
 CLICK_TIMEOUT = 90
+
+# Hard cap on the whole browser phase (security check + sign-in), whatever else happens
+MAX_BROWSER_PHASE_SECONDS = 240
 
 # Live view stuck on the "Verifying..." spinner: nudge a repaint, then reload the page for a fresh check
 SPINNER_NUDGE_AFTER = 12
@@ -86,8 +90,48 @@ def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
 class DIUHeadlessScraper:
     """Automates DIU Keycloak login headlessly and queries gateway7 with live streaming."""
 
-    async def scrape_stream(self, student_id: str, password: str):
-        """Asynchronous generator yielding live progress, student profile, and each semester as loaded."""
+    async def scrape_stream(self, student_id: str, password: str, client_ip: str = ""):
+        """
+        Asynchronous generator yielding live progress, student profile, and each semester as loaded.
+        Every run is recorded in the task history (outcome, stage reached, timings; never the password).
+        """
+        started = time.monotonic()
+        task = {
+            "task_id": uuid.uuid4().hex[:12], "student_id": student_id.strip(), "client_ip": client_ip,
+            "source": "live", "result": None, "stage": "connect", "message": "", "captcha_shown": 0,
+            "clicks": 0, "semesters": 0, "queue_wait_s": 0.0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            async for event in self._scrape_stream_inner(student_id, password, task):
+                etype = event.get("type")
+                if etype == "status" and event.get("step"):
+                    task["stage"] = event["step"]
+                elif etype == "challenge_required":
+                    task["captcha_shown"] = 1
+                elif etype == "semester":
+                    task["semesters"] += 1
+                elif etype == "error":
+                    task["result"] = event.get("code") or "failed"
+                    task["message"] = str(event.get("message", ""))[:200]
+                elif etype == "complete":
+                    task["result"] = "cached" if task["source"] == "cache" else "success"
+                    task["stage"] = "done"
+                yield event
+        except (GeneratorExit, asyncio.CancelledError):
+            task["result"] = task["result"] or "abandoned"  # user closed the page / disconnected
+            raise
+        except Exception as e:
+            task["result"] = "failed"
+            task["message"] = f"{type(e).__name__}: {e}"[:200]
+            raise
+        finally:
+            task["result"] = task["result"] or "abandoned"
+            task["duration_s"] = round(time.monotonic() - started, 1)
+            task["finished_at"] = datetime.now(timezone.utc).isoformat()
+            task_history.record(task)  # local SQLite insert, a few ms; safe during generator close
+
+    async def _scrape_stream_inner(self, student_id: str, password: str, task: dict):
         clean_id = student_id.strip()
 
         # Step 0: Transparent Database Cache Check (dynamic TTL from system settings)
@@ -114,6 +158,7 @@ class DIUHeadlessScraper:
                 if is_fresh:
                     results = cached.get("results_json", {})
                     if results and "student" in results:
+                        task["source"] = "cache"
                         yield {"type": "status", "message": "Connecting to DIU Student Portal..."}
                         await asyncio.sleep(0.04)
                         yield {"type": "student", "data": results.get("student", {})}
@@ -144,16 +189,16 @@ class DIUHeadlessScraper:
             print(f"[CACHE] Cache check bypassed due to error: {e}")
 
         if clean_id in _students_in_flight:
-            yield {"type": "error", "message": "A login for this Student ID is already in progress. Please wait for it to finish."}
+            yield {"type": "error", "code": "duplicate", "message": "A login for this Student ID is already in progress. Please wait for it to finish."}
             return
         _students_in_flight.add(clean_id)
         try:
-            async for event in self._browser_scrape_stream(clean_id, student_id, password):
+            async for event in self._browser_scrape_stream(clean_id, student_id, password, task):
                 yield event
         finally:
             _students_in_flight.discard(clean_id)
 
-    async def _browser_scrape_stream(self, clean_id: str, student_id: str, password: str):
+    async def _browser_scrape_stream(self, clean_id: str, student_id: str, password: str, task: dict):
         """Live login via Camoufox + gateway fetch. Caller guarantees one run per student at a time."""
         auth_code = None
         session_id = str(uuid.uuid4())
@@ -171,6 +216,7 @@ class DIUHeadlessScraper:
         yield {"type": "status", "step": "connect", "message": "Connecting to DIU Student Portal..."}
 
         queue_id = None
+        t_queued = time.monotonic()
         try:
             async for q_event in queue_manager.acquire_stream(clean_id):
                 if q_event.get("type") == "queue":
@@ -178,13 +224,15 @@ class DIUHeadlessScraper:
                 elif q_event.get("type") == "acquired":
                     queue_id = q_event.get("queue_id")
                     break
+            task["queue_wait_s"] = round(time.monotonic() - t_queued, 1)
         except QueueCancelledException:
             active_browser_sessions.pop(session_id, None)
-            yield {"type": "error", "message": "Scrape request was cancelled by administrator."}
+            yield {"type": "error", "code": "cancelled", "message": "Scrape request was cancelled by administrator."}
             return
-        except QueueFullException:
+        except (QueueFullException, QueueTimeoutException):
             active_browser_sessions.pop(session_id, None)
-            yield {"type": "error", "message": "The server is very busy right now. Please try again in a minute."}
+            task["queue_wait_s"] = round(time.monotonic() - t_queued, 1)
+            yield {"type": "error", "code": "busy", "message": "The server is very busy right now. Please try again in a minute."}
             return
         except BaseException:
             active_browser_sessions.pop(session_id, None)
@@ -193,6 +241,7 @@ class DIUHeadlessScraper:
         try:
             # Step 1: Login in a dedicated pre-warmed Camoufox browser
             t_launch = time.monotonic()
+            hard_deadline = t_launch + MAX_BROWSER_PHASE_SECONDS
             if not browser_pool.has_ready_browser():
                 msg = ("Starting a secure browser for you (~10s)..." if WARM_BROWSERS == 0
                        else "Busy moment - starting a secure browser for you (~10s)...")
@@ -251,9 +300,13 @@ class DIUHeadlessScraper:
                         check_url(page.url)
                         if auth_code:
                             break
-                        if time.monotonic() > phase_deadline:
-                            print(f"[TURNSTILE] {clean_id}: gave up - no checkbox/sign-in within {SECURITY_CHECK_TIMEOUT}s")
-                            yield {"type": "error", "message": "DIU's security check is taking too long right now. Please try again in a minute."}
+                        if queue_manager.is_cancelled(queue_id):
+                            print(f"[LOGIN] {clean_id}: cancelled by administrator")
+                            yield {"type": "error", "code": "cancelled", "message": "This lookup was cancelled by an administrator."}
+                            return
+                        if time.monotonic() > phase_deadline or time.monotonic() > hard_deadline:
+                            print(f"[TURNSTILE] {clean_id}: gave up - no sign-in within the time limit")
+                            yield {"type": "error", "code": "timeout", "message": "DIU's security check is taking too long right now. Please try again in a minute."}
                             return
 
                         await wait_or_code(250)
@@ -300,6 +353,8 @@ class DIUHeadlessScraper:
                                 # Until something is shown the security-check deadline applies; once the user
                                 # can see the widget they get CLICK_TIMEOUT to act.
                                 if (shown_at is None and now > phase_deadline) or (shown_at is not None and now - shown_at > CLICK_TIMEOUT):
+                                    break
+                                if now > hard_deadline or queue_manager.is_cancelled(queue_id):
                                     break
                                 check_url(page.url)
                                 if auth_code:
@@ -375,17 +430,26 @@ class DIUHeadlessScraper:
 
                             if auth_code:
                                 break
+                            if queue_manager.is_cancelled(queue_id):
+                                print(f"[LOGIN] {clean_id}: cancelled by administrator")
+                                yield {"type": "error", "code": "cancelled", "message": "This lookup was cancelled by an administrator."}
+                                return
+                            if time.monotonic() > hard_deadline:
+                                print(f"[TURNSTILE] {clean_id}: gave up - browser phase over {MAX_BROWSER_PHASE_SECONDS}s")
+                                yield {"type": "error", "code": "timeout", "message": "This took too long. Please try again."}
+                                return
 
                             if not clicked:
                                 if token_val and shown_at is not None:
                                     yield {"type": "challenge_solved"}  # passed without a click: close the modal
                                 elif not token_val and shown_at is not None:
                                     print(f"[TURNSTILE] {clean_id}: no click within {CLICK_TIMEOUT}s")
-                                    yield {"type": "error", "message": "Verification timed out. Please try again."}
+                                    yield {"type": "error", "code": "click_timeout", "message": "Verification timed out. Please try again."}
                                     return
                                 # otherwise nothing was shown before the deadline; the loop top reports it
                             else:
                                 t_clicked = time.monotonic()
+                                task["clicks"] = task.get("clicks", 0) + 1
                                 phase_deadline += t_clicked - shown_at  # the user's thinking time doesn't count
                                 coords = active_browser_sessions[session_id].get("click_coords")
                                 if coords:
@@ -446,7 +510,7 @@ class DIUHeadlessScraper:
                             err_txt = await error_el.text_content()
                             if err_txt and any(w in err_txt.lower() for w in ["invalid", "incorrect", "failed"]):
                                 print(f"[LOGIN] {clean_id}: portal rejected login: {err_txt.strip()}")
-                                yield {"type": "error", "message": err_txt.strip()}
+                                yield {"type": "error", "code": "wrong_password", "message": err_txt.strip()}
                                 return
 
                         # Check if username field is present and ready
@@ -471,7 +535,7 @@ class DIUHeadlessScraper:
                                     await wait_or_code(2000)
                 except Exception as e:
                     print(f"[LOGIN] {clean_id}: navigation failed: {e!r}")
-                    yield {"type": "error", "message": "Could not reach the DIU login page. Please try again."}
+                    yield {"type": "error", "code": "network", "message": "Could not reach the DIU login page. Please try again."}
                     return
         finally:
             active_browser_sessions.pop(session_id, None)
@@ -481,7 +545,7 @@ class DIUHeadlessScraper:
 
         if not auth_code:
             print(f"[LOGIN] {clean_id}: no auth code after login loop")
-            yield {"type": "error", "message": "Invalid Student ID or Password. Please try again."}
+            yield {"type": "error", "code": "failed", "message": "Invalid Student ID or Password. Please try again."}
             return
 
         print(f"[TIMING] {clean_id}: logged in {time.monotonic() - t_launch:.1f}s after start")
@@ -497,7 +561,7 @@ class DIUHeadlessScraper:
             })
 
             if token_resp.status_code != 200:
-                yield {"type": "error", "message": "Failed to exchange security token."}
+                yield {"type": "error", "code": "portal_error", "message": "Failed to exchange security token."}
                 return
 
             token_data = token_resp.json()

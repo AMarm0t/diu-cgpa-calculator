@@ -508,6 +508,9 @@ export default function Home() {
                         : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
                     }`}
                     placeholder="xxx-xx-xxx"
+                    maxLength={20}
+                    inputMode="numeric"
+                    autoComplete="username"
                     value={studentId}
                     onChange={(e) => setStudentId(e.target.value)}
                   />
@@ -528,6 +531,8 @@ export default function Home() {
                         : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
                     }`}
                     placeholder="••••••••"
+                    maxLength={64}
+                    autoComplete="current-password"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                   />
