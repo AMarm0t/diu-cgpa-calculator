@@ -51,6 +51,8 @@ WARM_BROWSERS = _default_warm_browsers()
 # Simultaneous Firefox launches. Launching is CPU-heavy: on 2 cores, parallel launches all finish
 # late, while serial ones hand the first user a browser after ~7s.
 LAUNCH_CONCURRENCY = int(os.getenv("LAUNCH_CONCURRENCY", str(max(1, (os.cpu_count() or 2) // 4))))
+# Free RAM needed to build a spare browser while a login is running (see _spare_build_allowed).
+SPARE_BUILD_MIN_FREE_MB = int(os.getenv("SPARE_BUILD_MIN_FREE_MB", "700"))
 # How long a login waits for a queued browser before launching its own as a fallback.
 SPARE_WAIT_TIMEOUT = 60
 
@@ -164,11 +166,23 @@ class BrowserPool:
         # Deleting the profile guarantees no student's Keycloak session survives into the next login
         await asyncio.to_thread(shutil.rmtree, warm.profile_dir, True)
 
+    def _spare_build_allowed(self) -> bool:
+        """
+        Spares are built while nothing is running, or while logins are running only if RAM clearly
+        fits a second browser. On a ~1 GB VM a spare built alongside a live login pushes both into
+        swap, the login's browser crawls, and Turnstile rejects the user's (late) clicks.
+        """
+        if self._in_use == 0 and self._waiters == 0:
+            return True
+        available = _meminfo_mb("MemAvailable")
+        return available is None or available >= SPARE_BUILD_MIN_FREE_MB
+
     def _schedule_launches(self):
-        """Launches enough browsers to cover every waiting login plus WARM_BROWSERS spares."""
+        """Launches a browser for every waiting login, plus WARM_BROWSERS spares when RAM allows."""
         if self._stopped:
             return
-        needed = WARM_BROWSERS + self._waiters - (self._ready.qsize() + self._inflight)
+        spares = WARM_BROWSERS if self._spare_build_allowed() else 0
+        needed = spares + self._waiters - (self._ready.qsize() + self._inflight)
         for _ in range(max(0, needed)):
             self._inflight += 1
             asyncio.create_task(self._launch_into_ready())
@@ -210,12 +224,13 @@ class BrowserPool:
             warm = await self._prepare()
 
         self._in_use += 1
-        self._schedule_launches()  # replace the spare this login consumed
+        self._schedule_launches()  # replace the spare now, if RAM fits two browsers
         try:
             yield warm.page
         finally:
             await self._close(warm)
             self._in_use -= 1
+            self._schedule_launches()  # otherwise replace it as soon as this login's RAM is freed
 
     def status(self) -> dict:
         return {
