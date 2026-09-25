@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 import httpx
 import db
-from browser_pool import browser_pool
+from browser_pool import browser_pool, WARM_BROWSERS
 from queue_manager import queue_manager, QueueCancelledException, QueueFullException
 from cgpa_calculator import calculate_overall_cgpa
 
@@ -153,7 +153,9 @@ class DIUHeadlessScraper:
             # Step 1: Login in a dedicated pre-warmed Camoufox browser
             t_launch = time.monotonic()
             if not browser_pool.has_ready_browser():
-                yield {"type": "status", "step": "connect", "message": "Busy moment - starting a secure browser for you (~10s)..."}
+                msg = ("Starting a secure browser for you (~10s)..." if WARM_BROWSERS == 0
+                       else "Busy moment - starting a secure browser for you (~10s)...")
+                yield {"type": "status", "step": "connect", "message": msg}
             async with browser_pool.page() as page:
                 print(f"[TIMING] {clean_id}: browser ready in {time.monotonic() - t_launch:.1f}s")
                 active_browser_sessions[session_id]["page"] = page
