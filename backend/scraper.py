@@ -43,8 +43,10 @@ CLICK_TIMEOUT = 90
 # Hard cap on the whole browser phase (security check + sign-in), whatever else happens
 MAX_BROWSER_PHASE_SECONDS = 240
 
-# Seconds of stream silence before a keep-alive comment is sent
-HEARTBEAT_SECONDS = 10
+# Seconds of stream silence before a keep-alive comment is sent. Short, because a visitor who left
+# (or moved to the other server) is only noticed when a write to them fails; until then they hold
+# their place in line.
+HEARTBEAT_SECONDS = 3
 
 # The browser phase marks itself alive at least this often while healthy; past it the page is
 # considered frozen and the login is aborted (see DIUHeadlessScraper._watched)

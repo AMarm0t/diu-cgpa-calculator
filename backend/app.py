@@ -165,7 +165,9 @@ async def capacity(http_request: Request):
     Lightweight, public, no-DB load snapshot the frontend polls to choose a server.
     free_slots > 0 means a login can start immediately; otherwise waiting is the queue length.
     """
-    enforce_rate_limit(http_request, "capacity", 120)
+    # Generous: waiting visitors poll it, and a whole campus can share one IP. It is only a
+    # few in-memory counters, and a refused check would make the site think this server is down.
+    enforce_rate_limit(http_request, "capacity", 600)
     q = queue_manager.get_status()
     b = browser_pool.status()
     active = q.get("active_count", 0)
