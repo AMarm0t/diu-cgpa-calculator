@@ -6,12 +6,14 @@ and interactive CAPTCHA relay when Cloudflare Turnstile requires user interactio
 import asyncio
 import os
 import base64
+import io
 import hashlib
 import uuid
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 import httpx
+from PIL import Image
 import db
 from browser_pool import browser_pool, WARM_BROWSERS
 from queue_manager import queue_manager, QueueCancelledException, QueueFullException
@@ -37,6 +39,11 @@ SECURITY_CHECK_TIMEOUT = 120
 # Seconds the user has to click once the live view of the security check is on screen
 CLICK_TIMEOUT = 90
 
+# Live view stuck on the "Verifying..." spinner: nudge a repaint, then reload the page for a fresh check
+SPINNER_NUDGE_AFTER = 12
+SPINNER_RELOAD_AFTER = 25
+MAX_WIDGET_RELOADS = 2
+
 TOKEN_JS = """() => {
     const el = document.querySelector('[name="cf-turnstile-response"]');
     return el && el.value ? el.value : null;
@@ -44,6 +51,27 @@ TOKEN_JS = """() => {
 
 # When set, extra per-step Turnstile diagnostics are logged
 TURNSTILE_DEBUG_DIR = os.environ.get("TURNSTILE_DEBUG_DIR", "")
+
+def looks_like_spinner(png: bytes) -> bool:
+    """
+    True if a Turnstile widget frame shows the green "Verifying..." spinner rather than the
+    checkbox. Counts green pixels in the left 60px (spinner dots); on real frames captured on
+    the server spinners had 57-66 and checkboxes 0.
+    """
+    try:
+        im = Image.open(io.BytesIO(png)).convert("RGB")
+    except Exception:
+        return False
+    w, h = im.size
+    px = im.load()
+    green = 0
+    for x in range(min(60, w)):
+        for y in range(h):
+            r, g, b = px[x, y]
+            if g > 100 and g > r + 40 and g > b + 15:
+                green += 1
+    return green > 15
+
 
 def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
     """Dispatches remote user click coordinates to the corresponding headless browser session."""
@@ -261,6 +289,10 @@ class DIUHeadlessScraper:
                             last_hash = None
                             shown_at = None
                             clicked = False
+                            showing_spinner = True
+                            last_change_at = time.monotonic()
+                            nudged = False
+                            reloads = 0
                             while True:
                                 now = time.monotonic()
                                 # Until something is shown the security-check deadline applies; once the user
@@ -278,8 +310,37 @@ class DIUHeadlessScraper:
                                     if box and box["width"] >= 200 and box["height"] >= 40:
                                         img = await page.screenshot(clip={k: box[k] for k in ("x", "y", "width", "height")}, timeout=8000)
                                         frame_hash = hashlib.md5(img).hexdigest()
+                                        if frame_hash == last_hash and showing_spinner:
+                                            stuck_for = time.monotonic() - last_change_at
+                                            if stuck_for > SPINNER_NUDGE_AFTER and not nudged:
+                                                # Painting on the server stalls at random; nudge a repaint
+                                                nudged = True
+                                                print(f"[TURNSTILE] {clean_id}: spinner frozen {stuck_for:.0f}s - nudging a repaint")
+                                                try:
+                                                    await page.mouse.move(box["x"] + box["width"] + 40, box["y"] + box["height"] + 40, steps=5)
+                                                    await asyncio.wait_for(page.evaluate(
+                                                        "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"), 3)
+                                                except Exception:
+                                                    pass
+                                            elif stuck_for > SPINNER_RELOAD_AFTER and reloads < MAX_WIDGET_RELOADS:
+                                                # Cloudflare itself sometimes hangs on "Verifying..."; a reload gets a fresh check
+                                                reloads += 1
+                                                print(f"[TURNSTILE] {clean_id}: spinner stuck {stuck_for:.0f}s - reloading the login page ({reloads}/{MAX_WIDGET_RELOADS})")
+                                                yield {"type": "status", "step": "verify", "message": "Security check got stuck - refreshing it..."}
+                                                await page.reload(wait_until="commit", timeout=45000)
+                                                await page.wait_for_selector('input#username, #kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]', timeout=30000)
+                                                widget = page.locator('#kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]').first
+                                                last_hash, nudged = None, False
+                                                last_change_at = time.monotonic()
+                                                if shown_at is not None:
+                                                    shown_at = time.monotonic()  # full click time after a refresh
+                                                continue
                                         if frame_hash != last_hash:
                                             last_hash = frame_hash
+                                            last_change_at = time.monotonic()
+                                            was_spinner, showing_spinner = showing_spinner, looks_like_spinner(img)
+                                            if was_spinner and not showing_spinner:
+                                                print(f"[TURNSTILE] {clean_id}: checkbox visible ({time.monotonic() - t_launch:.1f}s)")
                                             active_browser_sessions[session_id]["box"] = box
                                             if shown_at is None:
                                                 shown_at = time.monotonic()
