@@ -70,32 +70,42 @@ const STREAM_IDLE_LIMIT_MS = 45000;
 
 // Picks which server should handle a new login. Prefers a server with a free slot (a login can
 // start at once), choosing a warm one and the primary on ties; otherwise the shortest queue.
-// A server that doesn't answer its capacity check within 2.5s is treated as down and skipped.
+// A server that doesn't answer its capacity check within 2.5s is treated as down and skipped; once
+// any server has reported a free slot the others get only 300ms more, so a hung server doesn't
+// delay logins on a healthy one.
 // `avoid` (a server whose browser just froze) is only chosen when it is clearly the better option.
 async function pickServer(avoid?: string): Promise<string> {
   if (API_BASES.length === 1) return API_BASES[0];
-  const probes = await Promise.all(
-    API_BASES.map(async (base, index) => {
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 2500);
-        const r = await fetch(`${base}/api/capacity`, { signal: ctrl.signal, cache: "no-store" });
-        clearTimeout(timer);
-        if (!r.ok) return null;
-        const d = await r.json();
-        return {
-          base,
-          index,
-          free: Number(d.free_slots ?? 0),
-          waiting: Number(d.waiting ?? 999),
-          ready: Boolean(d.has_ready_browser),
-        };
-      } catch {
-        return null;
-      }
-    })
-  );
-  const up = probes.filter((p): p is NonNullable<typeof p> => p !== null);
+  type Probe = { base: string; index: number; free: number; waiting: number; ready: boolean };
+  const answers: (Probe | null)[] = API_BASES.map(() => null);
+  let onFree: () => void = () => {};
+  const someoneFree = new Promise<void>((resolve) => (onFree = resolve));
+  const probes = API_BASES.map(async (base, index) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2500);
+    try {
+      const r = await fetch(`${base}/api/capacity`, { signal: ctrl.signal, cache: "no-store" });
+      if (!r.ok) return;
+      const d = await r.json();
+      answers[index] = {
+        base,
+        index,
+        free: Number(d.free_slots ?? 0),
+        waiting: Number(d.waiting ?? 999),
+        ready: Boolean(d.has_ready_browser),
+      };
+      if (answers[index]!.free > 0) onFree();
+    } catch {
+      // unreachable or too slow: treated as down
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  await Promise.race([
+    Promise.all(probes),
+    someoneFree.then(() => new Promise((r) => setTimeout(r, 300))),
+  ]);
+  const up = answers.filter((p): p is Probe => p !== null);
   if (up.length === 0) return API_BASES[0]; // none answered; the request path will try failover
   const free = up.filter((s) => s.free > 0);
   if (free.length > 0) {
