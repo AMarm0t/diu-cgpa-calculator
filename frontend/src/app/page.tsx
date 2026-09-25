@@ -9,7 +9,9 @@ import {
   CheckCircle2, 
   ShieldCheck,
   Sun,
-  Moon
+  Moon,
+  Eye,
+  EyeOff
 } from "lucide-react";
 
 interface Course {
@@ -218,6 +220,7 @@ function LoginProgress({
 
 export default function Home() {
   const [studentId, setStudentId] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [password, setPassword] = useState("");
   
   const [theme, setTheme] = useState<"dark" | "light">("dark");
@@ -383,7 +386,7 @@ export default function Home() {
         throw new Error("Too many attempts. Please wait a minute and try again.");
       }
       if (response.status === 422) {
-        throw new Error("Please check your Student ID format (xxx-xx-xxx).");
+        throw new Error("Please check your Student ID (digits and dashes only).");
       }
       if (!response.ok || !response.body) {
         throw new Error("Unable to reach the calculation server. Please try again.");
@@ -630,9 +633,8 @@ export default function Home() {
                         ? "bg-[#101010] border-[#2b2b2b] text-white font-mono placeholder-[#555555] focus:border-[#3ecf8e] focus:ring-1 focus:ring-[#3ecf8e]"
                         : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
                     }`}
-                    placeholder="xxx-xx-xxx"
-                    maxLength={20}
-                    inputMode="numeric"
+                    placeholder="xxx-xx-xxx or full ID number"
+                    maxLength={24}
                     autoComplete="username"
                     value={studentId}
                     onChange={(e) => setStudentId(e.target.value)}
@@ -645,20 +647,37 @@ export default function Home() {
                   }`}>
                     Portal Password
                   </label>
-                  <input
-                    type="password"
-                    required
-                    className={`w-full px-4 py-3 rounded-lg border outline-none transition ${
-                      isDark
-                        ? "bg-[#101010] border-[#2b2b2b] text-white font-mono placeholder-[#555555] focus:border-[#3ecf8e] focus:ring-1 focus:ring-[#3ecf8e]"
-                        : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
-                    }`}
-                    placeholder="••••••••"
-                    maxLength={64}
-                    autoComplete="current-password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                  />
+                  <div className="relative">
+                    <input
+                      type={showPassword ? "text" : "password"}
+                      required
+                      className={`w-full pl-4 pr-12 py-3 rounded-lg border outline-none transition ${
+                        isDark
+                          ? "bg-[#101010] border-[#2b2b2b] text-white font-mono placeholder-[#555555] focus:border-[#3ecf8e] focus:ring-1 focus:ring-[#3ecf8e]"
+                          : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
+                      }`}
+                      placeholder="••••••••"
+                      maxLength={64}
+                      autoComplete="current-password"
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((v) => !v)}
+                      aria-label={showPassword ? "Hide password" : "Show password"}
+                      aria-pressed={showPassword}
+                      title={showPassword ? "Hide password" : "Show password"}
+                      className={`absolute inset-y-0 right-0 flex items-center px-3.5 rounded-r-lg transition cursor-pointer ${
+                        isDark ? "text-[#777777] hover:text-[#3ecf8e]" : "text-slate-400 hover:text-teal-600"
+                      }`}
+                    >
+                      {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                    </button>
+                  </div>
                 </div>
 
                 {error && (

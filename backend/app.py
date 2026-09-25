@@ -33,8 +33,9 @@ import task_history
 
 # Request models. Strict bounds keep junk out of the browser login, gateway URLs and the database.
 class ScrapeRequest(BaseModel):
-    # DIU student IDs look like xxx-xx-xxx: digits in three dash-separated groups
-    student_id: str = Field(..., min_length=6, max_length=20, pattern=r"^\s*\d{2,4}-\d{2,3}-\d{2,6}\s*$")
+    # DIU student IDs come as xxx-xx-xxx or as one long number: digits, optionally in
+    # dash-separated groups. Nothing else, so no code or encoded payloads fit.
+    student_id: str = Field(..., min_length=5, max_length=24, pattern=r"^\s*[0-9]+(?:-[0-9]+){0,4}\s*$")
     # Any printable characters (real passwords use symbols), but bounded and no control characters
     password: str = Field(..., min_length=1, max_length=64, pattern=r"^[^\x00-\x1f\x7f]+$")
 

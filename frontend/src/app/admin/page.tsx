@@ -566,7 +566,7 @@ export default function AdminPage() {
         throw new Error("Too many attempts. Please wait a minute and try again.");
       }
       if (response.status === 422) {
-        throw new Error("Check the Student ID format (xxx-xx-xxx) and password length (max 64).");
+        throw new Error("Check the Student ID (digits and dashes only) and password length (max 64).");
       }
       if (!response.ok || !response.body) {
         throw new Error("Unable to communicate with scraping server.");
@@ -1248,8 +1248,8 @@ export default function AdminPage() {
                       <label className="text-xs font-mono text-[#888888]">Student ID</label>
                       <input
                         type="text"
-                        placeholder="xxx-xx-xxx"
-                        maxLength={20}
+                        placeholder="xxx-xx-xxx or full ID number"
+                        maxLength={24}
                         value={scrapeStudentId}
                         onChange={(e) => setScrapeStudentId(e.target.value)}
                         disabled={isScrapingAdmin}
