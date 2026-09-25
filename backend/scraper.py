@@ -335,6 +335,9 @@ class DIUHeadlessScraper:
                                                 if shown_at is not None:
                                                     shown_at = time.monotonic()  # full click time after a refresh
                                                 continue
+                                        if session_event.is_set():
+                                            clicked = True  # a click arrived meanwhile: no more frames
+                                            break
                                         if frame_hash != last_hash:
                                             last_hash = frame_hash
                                             last_change_at = time.monotonic()

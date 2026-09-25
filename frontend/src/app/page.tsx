@@ -196,15 +196,19 @@ export default function Home() {
   const [challengeData, setChallengeData] = useState<ChallengeData | null>(null);
   const [isClicking, setIsClicking] = useState(false);
   const clickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // Ref (not state) so the SSE loop's closure sees the current value
+  const clickedRef = useRef(false);
 
   const [data, setData] = useState<StudentData | null>(null);
 
   const handleChallengeClick = async (e: React.MouseEvent<HTMLElement> | React.TouchEvent<HTMLElement>) => {
-    if (!challengeData || isClicking) return;
+    if (!challengeData || isClicking || clickedRef.current) return;
+    clickedRef.current = true;
     setIsClicking(true);
 
     if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
     clickTimeoutRef.current = setTimeout(() => {
+      clickedRef.current = false;
       setIsClicking(false);
     }, 15000); // backend polls up to ~10s after a click before answering
 
@@ -255,6 +259,7 @@ export default function Home() {
     } catch (err) {
       console.error("Failed to forward captcha click:", err);
       if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+      clickedRef.current = false;
       setIsClicking(false);
     }
   };
@@ -266,6 +271,7 @@ export default function Home() {
     setLoadingMsg("Connecting to DIU Student Portal...");
     setLoginStep("connect");
     setQueuePosition(null);
+    clickedRef.current = false;
     setChallengeData(null);
 
     try {
@@ -317,21 +323,27 @@ export default function Home() {
               }
               setLoadingMsg(payload.message);
             } else if (payload.type === "challenge_required") {
-              if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
               setChallengeData({
                 sessionId: payload.session_id,
                 image: payload.image,
                 box: payload.box || { x: 0, y: 0, width: 300, height: 65 }
               });
-              setIsClicking(false);
+              // A live-view frame that was already on its way when the user clicked must not
+              // cancel the "Solving challenge..." state; only a retry/solved event ends it.
+              if (!clickedRef.current) {
+                if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+                setIsClicking(false);
+              }
             } else if (payload.type === "challenge_retry") {
               // The screenshot is stale; close the modal until the backend sends a fresh challenge_required
               if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+              clickedRef.current = false;
               setChallengeData(null);
               setIsClicking(false);
               setLoadingMsg(payload.message || "Please click the checkbox again.");
             } else if (payload.type === "challenge_solved") {
               if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+              clickedRef.current = false;
               setChallengeData(null);
               setIsClicking(false);
             } else if (payload.type === "error") {
@@ -384,6 +396,7 @@ export default function Home() {
       if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
       setIsLoading(false);
       setIsStreaming(false);
+      clickedRef.current = false;
       setChallengeData(null);
       setIsClicking(false);
     }
