@@ -276,7 +276,9 @@ class BrowserPool:
             print(f"[BROWSER] Background launch failed: {e}")
             return
         self._inflight -= 1
-        if self._stopped:
+        if self._stopped or (self._waiters == 0 and self._ready.qsize() >= WARM_BROWSERS):
+            # Stopping, or the login it was launched for left meanwhile and no spare is wanted:
+            # an idle browser only gets swapped out on a small VM
             await self._close(warm)
         else:
             self._ready.put_nowait(warm)  # hands it to the longest-waiting login, if any
