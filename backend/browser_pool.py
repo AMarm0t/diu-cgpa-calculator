@@ -26,6 +26,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Optional
 
+from camoufox import DefaultAddons
 from camoufox.async_api import AsyncNewBrowser
 from playwright.async_api import async_playwright, BrowserContext, Page, Playwright
 
@@ -33,13 +34,19 @@ from queue_manager import _meminfo_mb
 
 
 def _default_warm_browsers() -> int:
-    """WARM_BROWSERS env var if set, otherwise sized from RAM (~240 MB per idle spare)."""
+    """
+    WARM_BROWSERS env var if set, otherwise sized from RAM (~450 MB per idle spare).
+    Below 1.5 GB there are none: an idle browser gets swapped out, and paging it back in during
+    a login is slower than launching fresh (measured on a 887 MB Azure B2ats_v2).
+    """
     env = os.getenv("WARM_BROWSERS")
     if env:
         return max(0, int(env))
     total = _meminfo_mb("MemTotal")
     if total is None:
         return 2
+    if total < 1536:
+        return 0
     if total < 2048:
         return 1
     if total < 4096:
@@ -70,7 +77,13 @@ LOW_MEMORY_FIREFOX_PREFS = {
     "media.memory_cache_max_size": 1024,
     "browser.sessionstore.max_tabs_undo": 0,
     "extensions.pocket.enabled": False,
+    "media.rdd-process.enabled": False,            # no separate media-decoder process
+    "extensions.webextensions.remote": False,      # no separate extensions process
 }
+
+# Camoufox bundles uBlock Origin by default; the login flow doesn't need it (~100 MB with the
+# prefs above, measured on the server).
+EXCLUDED_ADDONS = [DefaultAddons.UBO]
 
 
 @dataclass
@@ -145,6 +158,7 @@ class BrowserPool:
                     persistent_context=True,
                     user_data_dir=profile_dir,
                     firefox_user_prefs=LOW_MEMORY_FIREFOX_PREFS,
+                    exclude_addons=EXCLUDED_ADDONS,
                 )
                 try:
                     page = context.pages[0] if context.pages else await context.new_page()

@@ -29,6 +29,9 @@ _students_in_flight: set[str] = set()
 # Parallel gateway requests when scanning semester results
 SEMESTER_FETCH_CONCURRENCY = 10
 
+# Max seconds from login page load to sign-in, excluding time spent waiting for the user's click
+SECURITY_CHECK_TIMEOUT = 120
+
 def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
     """Dispatches remote user click coordinates to the corresponding headless browser session."""
     session = active_browser_sessions.get(session_id)
@@ -196,12 +199,19 @@ class DIUHeadlessScraper:
                     except Exception:
                         pass
                     print(f"[TIMING] {clean_id}: login page ready {time.monotonic() - t_launch:.1f}s after launch start")
+                    # Hard limit for the whole security-check + sign-in phase, so a stuck Turnstile
+                    # never leaves the user on a silent spinner (user click waits are excluded below).
+                    phase_deadline = time.monotonic() + SECURITY_CHECK_TIMEOUT
 
                     # Loop through challenge and login steps
                     for attempt in range(45):
                         check_url(page.url)
                         if auth_code:
                             break
+                        if time.monotonic() > phase_deadline:
+                            print(f"[TURNSTILE] {clean_id}: gave up - no checkbox/sign-in within {SECURITY_CHECK_TIMEOUT}s")
+                            yield {"type": "error", "message": "DIU's security check is taking too long right now. Please try again in a minute."}
+                            return
 
                         await wait_or_code(250)
 
@@ -234,10 +244,14 @@ class DIUHeadlessScraper:
                             settled_img = None
                             prev_img = None
                             identical = 0
-                            for _ in range(60):
+                            wait_started = last_progress = time.monotonic()
+                            while time.monotonic() < phase_deadline:
                                 check_url(page.url)
                                 if auth_code:
                                     break
+                                if time.monotonic() - last_progress >= 10:
+                                    last_progress = time.monotonic()
+                                    print(f"[TURNSTILE] {clean_id}: still verifying ({last_progress - wait_started:.0f}s, identical frames={identical})")
                                 token_val = await page.evaluate("""() => {
                                     const el = document.querySelector('[name="cf-turnstile-response"]');
                                     return el && el.value ? el.value : null;
@@ -249,14 +263,16 @@ class DIUHeadlessScraper:
                                 try:
                                     wbox = await widget.bounding_box()
                                     if wbox and wbox["width"] >= 200 and wbox["height"] >= 40:
-                                        img = await widget.screenshot(timeout=3000)
+                                        img = await widget.screenshot(timeout=10000)
                                         identical = identical + 1 if img == prev_img else 0
                                         prev_img = img
                                         if identical >= 2:
                                             settled_img = img
                                             break
                                 except Exception:
-                                    prev_img, identical = None, 0
+                                    # A slow/frozen browser (low-RAM server) times out a screenshot now and
+                                    # then; keep the streak instead of resetting it, or it never settles.
+                                    pass
                                 await page.wait_for_timeout(300)
 
                             if auth_code:
@@ -283,8 +299,10 @@ class DIUHeadlessScraper:
 
                                         # Wait for user click from website modal
                                         try:
+                                            t_shown = time.monotonic()
                                             await asyncio.wait_for(session_event.wait(), timeout=60.0)
                                             t_clicked = time.monotonic()
+                                            phase_deadline += t_clicked - t_shown  # the user's thinking time doesn't count
                                             coords = active_browser_sessions[session_id].get("click_coords")
                                             if coords:
                                                 click_x = float(coords["x"])
