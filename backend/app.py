@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import json
 import os
+import socket
 import sys
 import time
 from collections import defaultdict, deque
@@ -57,6 +58,10 @@ class ManualSemester(BaseModel):
 
 class ManualCgpaRequest(BaseModel):
     semesters: list[ManualSemester] = Field(..., min_length=1, max_length=30)
+
+# A short name for this server, shown in the admin panel so each task/queue entry can be traced
+# to the machine that handled it. Set NODE_NAME per server (e.g. azure-1, azure-2).
+NODE_NAME = os.environ.get("NODE_NAME") or socket.gethostname()
 
 # FastAPI app
 # Interactive API docs (/docs, /redoc, /openapi.json) map every endpoint for an attacker;
@@ -151,7 +156,28 @@ def enforce_rate_limit(request: Request, bucket: str, limit_per_min: int):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "DIU CGPA Calculator API (Headless)"}
+    return {"status": "ok", "service": "DIU CGPA Calculator API (Headless)", "node": NODE_NAME}
+
+@app.get("/api/capacity")
+async def capacity(http_request: Request):
+    """
+    Lightweight, public, no-DB load snapshot the frontend polls to choose a server.
+    free_slots > 0 means a login can start immediately; otherwise waiting is the queue length.
+    """
+    enforce_rate_limit(http_request, "capacity", 120)
+    q = queue_manager.get_status()
+    b = browser_pool.status()
+    active = q.get("active_count", 0)
+    limit = q.get("limit", 1)
+    return {
+        "node": NODE_NAME,
+        "limit": limit,
+        "active": active,
+        "free_slots": max(0, limit - active),
+        "waiting": q.get("waiting_count", 0),
+        "has_ready_browser": browser_pool.has_ready_browser(),
+        "warm_spares": b.get("warm_spares", 0),
+    }
 
 @app.post("/api/scrape-stream")
 async def scrape_stream_endpoint(request: ScrapeRequest, http_request: Request, authorization: Optional[str] = Header(None)):
@@ -318,7 +344,7 @@ async def admin_task_history(limit: int = 100, result: Optional[str] = None, adm
         raise HTTPException(status_code=400, detail="Unknown result filter")
     tasks = await asyncio.to_thread(task_history.recent, limit, result)
     counts = await asyncio.to_thread(task_history.summary)
-    return {"status": "ok", "tasks": tasks, "counts": counts}
+    return {"status": "ok", "node": NODE_NAME, "tasks": tasks, "counts": counts}
 
 
 class QueueRemoveRequest(BaseModel):
@@ -327,7 +353,7 @@ class QueueRemoveRequest(BaseModel):
 @app.get("/api/admin/queue")
 async def admin_get_queue(admin: dict = Depends(get_current_admin)):
     """Returns current live queue status, running scrapers, and waiting requests."""
-    return {"status": "ok", "queue": {**queue_manager.get_status(), "browser": browser_pool.status()}}
+    return {"status": "ok", "node": NODE_NAME, "queue": {**queue_manager.get_status(), "browser": browser_pool.status()}}
 
 @app.post("/api/admin/queue/remove")
 async def admin_remove_queue(req: QueueRemoveRequest, admin: dict = Depends(get_current_admin)):

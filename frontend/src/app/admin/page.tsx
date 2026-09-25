@@ -33,7 +33,18 @@ import {
   Activity
 } from "lucide-react";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://api.resultscraper.app";
+// Backend servers (comma-separated in NEXT_PUBLIC_API_URLS). The first is primary; the admin
+// panel queries all of them for queue and history and merges the results.
+const API_BASES = (
+  process.env.NEXT_PUBLIC_API_URLS ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  "https://api.resultscraper.app"
+)
+  .split(",")
+  .map((s) => s.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+// DB-backed calls (students, settings, direct scrape) can use any server, so use the primary.
+const API_BASE = API_BASES[0];
 
 interface AdminProfile {
   name: string;
@@ -97,6 +108,8 @@ interface QueueItemRecord {
   status: "waiting" | "running" | "cancelling" | "cancelled";
   queued_at: string;
   started_at?: string | null;
+  node?: string; // which server this item is on
+  base?: string; // that server's API base URL (for routing cancel actions)
 }
 
 interface QueueStatusRecord {
@@ -105,6 +118,17 @@ interface QueueStatusRecord {
   waiting_count: number;
   running: QueueItemRecord[];
   waiting: QueueItemRecord[];
+  browser?: { warm_spares: number; in_use: number; launching: number; waiting_for_browser: number };
+}
+
+// One backend server's live status, for the per-server cards.
+interface ServerStatus {
+  base: string;
+  node: string;
+  online: boolean;
+  limit: number;
+  active: number;
+  waiting: number;
   browser?: { warm_spares: number; in_use: number; launching: number; waiting_for_browser: number };
 }
 
@@ -123,6 +147,7 @@ interface TaskRecord {
   duration_s: number | null;
   started_at: string;
   finished_at: string | null;
+  node?: string; // which server handled it
 }
 
 // Label + colour for each task outcome recorded by the backend
@@ -196,6 +221,8 @@ export default function AdminPage() {
   const [history, setHistory] = useState<TaskRecord[]>([]);
   const [historyCounts, setHistoryCounts] = useState<Record<string, number>>({});
   const [historyFilter, setHistoryFilter] = useState<string>("all");
+  const [servers, setServers] = useState<ServerStatus[]>([]);
+  const multiServer = API_BASES.length > 1;
 
   const showToast = (text: string, type: "success" | "error" = "success") => {
     setToastMessage({ text, type });
@@ -307,43 +334,110 @@ export default function AdminPage() {
   // Fetch Scraper Queue Status
   const fetchQueue = useCallback(async () => {
     if (!token) return;
-    try {
-      const res = await fetch(`${API_BASE}/api/admin/queue`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setQueueData(data.queue);
-      }
-    } catch (err) {
-      console.error("Failed to load queue:", err);
-    }
+    type Down = { base: string; node: string; online: false };
+    type Up = {
+      base: string;
+      node: string;
+      online: true;
+      limit: number;
+      active: number;
+      waiting: number;
+      browser?: ServerStatus["browser"];
+      running: QueueItemRecord[];
+      waitingItems: QueueItemRecord[];
+    };
+    const perServer: (Up | Down)[] = await Promise.all(
+      API_BASES.map(async (base): Promise<Up | Down> => {
+        try {
+          const res = await fetch(`${base}/api/admin/queue`, {
+            headers: { Authorization: `Bearer ${token}` },
+            cache: "no-store",
+          });
+          if (!res.ok) return { base, node: base, online: false };
+          const data = await res.json();
+          const q = data.queue || {};
+          const node: string = data.node || base;
+          const tag = (items: QueueItemRecord[] = []) => items.map((it) => ({ ...it, node, base }));
+          return {
+            base,
+            node,
+            online: true,
+            limit: q.limit || 0,
+            active: q.active_count || 0,
+            waiting: q.waiting_count || 0,
+            browser: q.browser,
+            running: tag(q.running),
+            waitingItems: tag(q.waiting),
+          };
+        } catch {
+          return { base, node: base, online: false };
+        }
+      })
+    );
+
+    setServers(
+      perServer.map((s) => ({
+        base: s.base,
+        node: s.node,
+        online: s.online,
+        limit: s.online ? s.limit : 0,
+        active: s.online ? s.active : 0,
+        waiting: s.online ? s.waiting : 0,
+        browser: s.online ? s.browser : undefined,
+      }))
+    );
+
+    const online = perServer.filter((s): s is Up => s.online);
+    setQueueData({
+      limit: online.reduce((a, s) => a + s.limit, 0),
+      active_count: online.reduce((a, s) => a + s.active, 0),
+      waiting_count: online.reduce((a, s) => a + s.waiting, 0),
+      running: online.flatMap((s) => s.running),
+      waiting: online.flatMap((s) => s.waitingItems),
+      browser: online.length === 1 ? online[0].browser : undefined,
+    });
   }, [token]);
 
   // Fetch recent task history with outcomes
   const fetchHistory = useCallback(async () => {
     if (!token) return;
-    try {
-      const qs = historyFilter === "all" ? "" : `&result=${encodeURIComponent(historyFilter)}`;
-      const res = await fetch(`${API_BASE}/api/admin/history?limit=100${qs}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setHistory(data.tasks || []);
-        setHistoryCounts(data.counts || {});
-      }
-    } catch (err) {
-      console.error("Failed to load task history:", err);
+    const qs = historyFilter === "all" ? "" : `&result=${encodeURIComponent(historyFilter)}`;
+    const perServer = await Promise.all(
+      API_BASES.map(async (base) => {
+        try {
+          const res = await fetch(`${base}/api/admin/history?limit=100${qs}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            cache: "no-store",
+          });
+          if (!res.ok) return null;
+          const data = await res.json();
+          const node: string = data.node || base;
+          const tasks: TaskRecord[] = (data.tasks || []).map((t: TaskRecord) => ({ ...t, node }));
+          return { tasks, counts: (data.counts || {}) as Record<string, number> };
+        } catch {
+          return null;
+        }
+      })
+    );
+    const ok = perServer.filter((r): r is NonNullable<typeof r> => r !== null);
+    const merged = ok
+      .flatMap((r) => r.tasks)
+      .sort((a, b) => (b.started_at || "").localeCompare(a.started_at || ""))
+      .slice(0, 100);
+    const counts: Record<string, number> = {};
+    for (const r of ok) {
+      for (const [k, v] of Object.entries(r.counts)) counts[k] = (counts[k] || 0) + (v as number);
     }
+    setHistory(merged);
+    setHistoryCounts(counts);
   }, [token, historyFilter]);
 
   // Remove individual student from queue
-  const handleRemoveFromQueue = async (id: string) => {
+  const handleRemoveFromQueue = async (id: string, base: string = API_BASE) => {
     if (!token || isActionQueueLoading) return;
     setIsActionQueueLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/api/admin/queue/remove`, {
+      const res = await fetch(`${base}/api/admin/queue/remove`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -370,19 +464,26 @@ export default function AdminPage() {
     if (!token || isActionQueueLoading) return;
     setIsActionQueueLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/api/admin/queue/clear`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`
-        }
-      });
-      const data = await res.json();
-      if (res.ok) {
-        showToast(data.message || "Queue cleared successfully.", "success");
+      // Clear the waiting line on every server.
+      const results = await Promise.all(
+        API_BASES.map(async (base) => {
+          try {
+            const res = await fetch(`${base}/api/admin/queue/clear`, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            return res.ok;
+          } catch {
+            return false;
+          }
+        })
+      );
+      if (results.some(Boolean)) {
+        showToast("Queue cleared successfully.", "success");
         setShowClearConfirm(false);
         fetchQueue();
       } else {
-        showToast(data.detail || "Failed to clear queue.", "error");
+        showToast("Failed to clear queue.", "error");
       }
     } catch {
       showToast("Error connecting to server.", "error");
@@ -1289,6 +1390,44 @@ export default function AdminPage() {
                   </div>
                 </div>
 
+                {/* Per-server status (only when more than one backend) */}
+                {multiServer && servers.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {servers.map((s) => (
+                      <div key={s.base} className="bg-[#161616] border border-[#242424] p-4 rounded-lg">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-mono font-bold text-white">{s.node}</span>
+                          <span
+                            className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-mono border ${
+                              s.online
+                                ? "bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30"
+                                : "bg-red-950/40 text-red-300 border-red-500/30"
+                            }`}
+                          >
+                            <span className={`w-1.5 h-1.5 rounded-full ${s.online ? "bg-[#3ecf8e]" : "bg-red-400"}`} />
+                            {s.online ? "Online" : "Offline"}
+                          </span>
+                        </div>
+                        {s.online ? (
+                          <div className="text-[11px] font-mono text-[#888888] space-y-0.5">
+                            <div>Active {s.active} / {s.limit} · waiting {s.waiting}</div>
+                            {s.browser && (
+                              <div>
+                                Browsers: {s.browser.in_use} in use, {s.browser.warm_spares} ready
+                                {s.browser.launching ? `, ${s.browser.launching} starting` : ""}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="text-[11px] font-mono text-red-300/70">
+                            Not reachable — its logins are handled by the other server.
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 {/* Section 1: Active Running Scrapers */}
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
@@ -1303,6 +1442,7 @@ export default function AdminPage() {
                       <table className="w-full text-left text-xs font-mono">
                         <thead className="bg-[#1b1b1b] border-b border-[#242424] text-[10px] text-[#888888] uppercase">
                           <tr>
+                            {multiServer && <th className="px-4 py-2.5">Server</th>}
                             <th className="px-4 py-2.5">Student ID</th>
                             <th className="px-4 py-2.5">Status</th>
                             <th className="px-4 py-2.5">Started At</th>
@@ -1312,6 +1452,9 @@ export default function AdminPage() {
                         <tbody className="divide-y divide-[#222222]">
                           {queueData.running.map((item) => (
                             <tr key={item.queue_id} className="hover:bg-[#1a1a1a]">
+                              {multiServer && (
+                                <td className="px-4 py-3 text-[#3ecf8e]">{item.node || "-"}</td>
+                              )}
                               <td className="px-4 py-3 font-semibold text-white">
                                 {item.student_id}
                               </td>
@@ -1334,7 +1477,7 @@ export default function AdminPage() {
                               <td className="px-4 py-3 text-right">
                                 <button
                                   type="button"
-                                  onClick={() => handleRemoveFromQueue(item.queue_id)}
+                                  onClick={() => handleRemoveFromQueue(item.queue_id, item.base)}
                                   disabled={isActionQueueLoading || item.status === "cancelling"}
                                   className="px-2.5 py-1 rounded bg-red-950/40 hover:bg-red-900/60 border border-red-500/30 text-red-300 hover:text-red-200 text-xs transition-colors cursor-pointer disabled:opacity-50"
                                 >
@@ -1368,6 +1511,7 @@ export default function AdminPage() {
                         <thead className="bg-[#1b1b1b] border-b border-[#242424] text-[10px] text-[#888888] uppercase">
                           <tr>
                             <th className="px-4 py-2.5">Position</th>
+                            {multiServer && <th className="px-4 py-2.5">Server</th>}
                             <th className="px-4 py-2.5">Student ID</th>
                             <th className="px-4 py-2.5">Status</th>
                             <th className="px-4 py-2.5">Queued At</th>
@@ -1380,6 +1524,9 @@ export default function AdminPage() {
                               <td className="px-4 py-3 text-amber-400 font-bold">
                                 #{index + 1}
                               </td>
+                              {multiServer && (
+                                <td className="px-4 py-3 text-[#3ecf8e]">{item.node || "-"}</td>
+                              )}
                               <td className="px-4 py-3 font-semibold text-white">
                                 {item.student_id}
                               </td>
@@ -1394,7 +1541,7 @@ export default function AdminPage() {
                               <td className="px-4 py-3 text-right">
                                 <button
                                   type="button"
-                                  onClick={() => handleRemoveFromQueue(item.queue_id)}
+                                  onClick={() => handleRemoveFromQueue(item.queue_id, item.base)}
                                   disabled={isActionQueueLoading}
                                   className="px-2.5 py-1 rounded bg-red-950/40 hover:bg-red-900/60 border border-red-500/30 text-red-300 hover:text-red-200 text-xs transition-colors cursor-pointer disabled:opacity-50"
                                 >
@@ -1441,6 +1588,7 @@ export default function AdminPage() {
                         <thead className="bg-[#1b1b1b] border-b border-[#242424] text-[10px] text-[#888888] uppercase">
                           <tr>
                             <th className="px-4 py-2.5">Time</th>
+                            {multiServer && <th className="px-4 py-2.5">Server</th>}
                             <th className="px-4 py-2.5">Student ID</th>
                             <th className="px-4 py-2.5">Result</th>
                             <th className="px-4 py-2.5">Duration</th>
@@ -1457,6 +1605,9 @@ export default function AdminPage() {
                                 <td className="px-4 py-3 text-[#888888] whitespace-nowrap">
                                   {new Date(t.started_at).toLocaleString()}
                                 </td>
+                                {multiServer && (
+                                  <td className="px-4 py-3 text-[#3ecf8e] whitespace-nowrap">{t.node || "-"}</td>
+                                )}
                                 <td className="px-4 py-3 font-semibold text-white whitespace-nowrap">{t.student_id}</td>
                                 <td className="px-4 py-3">
                                   <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] border whitespace-nowrap ${meta.cls}`}>

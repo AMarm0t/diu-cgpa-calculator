@@ -52,7 +52,54 @@ interface ChallengeData {
   };
 }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://api.resultscraper.app";
+// One or more backend servers, comma-separated in NEXT_PUBLIC_API_URLS. Falls back to the single
+// NEXT_PUBLIC_API_URL. The first entry is the primary; later ones absorb overflow and act as failover.
+const API_BASES = (
+  process.env.NEXT_PUBLIC_API_URLS ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  "https://api.resultscraper.app"
+)
+  .split(",")
+  .map((s) => s.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+const API_BASE = API_BASES[0];
+
+// Picks which server should handle a new login. Prefers a server with a free slot (a login can
+// start at once), choosing a warm one and the primary on ties; otherwise the shortest queue.
+// A server that doesn't answer its capacity check within 2.5s is treated as down and skipped.
+async function pickServer(): Promise<string> {
+  if (API_BASES.length === 1) return API_BASES[0];
+  const probes = await Promise.all(
+    API_BASES.map(async (base, index) => {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 2500);
+        const r = await fetch(`${base}/api/capacity`, { signal: ctrl.signal, cache: "no-store" });
+        clearTimeout(timer);
+        if (!r.ok) return null;
+        const d = await r.json();
+        return {
+          base,
+          index,
+          free: Number(d.free_slots ?? 0),
+          waiting: Number(d.waiting ?? 999),
+          ready: Boolean(d.has_ready_browser),
+        };
+      } catch {
+        return null;
+      }
+    })
+  );
+  const up = probes.filter((p): p is NonNullable<typeof p> => p !== null);
+  if (up.length === 0) return API_BASES[0]; // none answered; the request path will try failover
+  const free = up.filter((s) => s.free > 0);
+  if (free.length > 0) {
+    free.sort((a, b) => Number(b.ready) - Number(a.ready) || a.index - b.index);
+    return free[0].base;
+  }
+  up.sort((a, b) => a.waiting - b.waiting || a.index - b.index);
+  return up[0].base;
+}
 
 function ThemeToggle({ isDark, onToggle }: { isDark: boolean; onToggle: () => void }) {
   return (
@@ -198,6 +245,8 @@ export default function Home() {
   const clickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   // Ref (not state) so the SSE loop's closure sees the current value
   const clickedRef = useRef(false);
+  // The server chosen for the current login; the captcha click must go to the same one.
+  const activeApiRef = useRef(API_BASE);
 
   const [data, setData] = useState<StudentData | null>(null);
 
@@ -247,7 +296,7 @@ export default function Home() {
     }
 
     try {
-      const res = await fetch(`${API_BASE}/api/captcha-click`, {
+      const res = await fetch(`${activeApiRef.current}/api/captcha-click`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -280,12 +329,36 @@ export default function Home() {
     setChallengeData(null);
 
     try {
-      const response = await fetch(`${API_BASE}/api/scrape-stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({ student_id: studentId.trim(), password: password.trim() }),
-      });
+      // Choose the least-busy server, then try it; if it can't be reached (network error or the
+      // tunnel/gateway is down), fall back to the others in primary-first order. A real answer
+      // from a server -- including 429/422 -- is kept, not retried.
+      const first = await pickServer();
+      const ordered = [first, ...API_BASES.filter((b) => b !== first)];
+      let response: Response | null = null;
+      let lastErr: unknown = null;
+      for (const base of ordered) {
+        try {
+          const r = await fetch(`${base}/api/scrape-stream`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store",
+            body: JSON.stringify({ student_id: studentId.trim(), password: password.trim() }),
+          });
+          if (r.status >= 502 && r.status <= 504) {
+            lastErr = new Error(`server ${base} unavailable (${r.status})`);
+            continue; // tunnel/gateway down: try the next server
+          }
+          activeApiRef.current = base;
+          response = r;
+          break;
+        } catch (e) {
+          lastErr = e; // network-level failure: try the next server
+        }
+      }
+      if (!response) {
+        throw new Error("Unable to reach the calculation server. Please try again.");
+      }
+      void lastErr;
 
       if (response.status === 429) {
         throw new Error("Too many attempts. Please wait a minute and try again.");
