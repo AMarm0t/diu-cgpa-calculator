@@ -19,6 +19,8 @@ Every login gets its own browser on a brand-new temporary profile, deleted after
 import asyncio
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -86,6 +88,31 @@ LOW_MEMORY_FIREFOX_PREFS = {
 EXCLUDED_ADDONS = [DefaultAddons.UBO]
 
 
+def _kill_orphaned_xvfb():
+    """
+    Kills this user's Xvfb virtual displays whose parent process is gone (reparented to PID 1).
+    They are left behind when the service is restarted mid-login; each holds a few MB forever.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        out = subprocess.run(["ps", "-u", str(os.getuid()), "-o", "pid=,ppid=,comm="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return
+    killed = 0
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[2].strip() == "Xvfb" and parts[1] == "1":
+            try:
+                os.kill(int(parts[0]), signal.SIGTERM)
+                killed += 1
+            except OSError:
+                pass
+    if killed:
+        print(f"[BROWSER] Cleaned up {killed} orphaned virtual display(s)")
+
+
 @dataclass
 class _Warm:
     context: BrowserContext
@@ -113,6 +140,7 @@ class BrowserPool:
         self._stopped = False
         shutil.rmtree(PROFILE_ROOT, ignore_errors=True)
         os.makedirs(PROFILE_ROOT, exist_ok=True)
+        _kill_orphaned_xvfb()
         print(f"[BROWSER] Warm spares: {WARM_BROWSERS}, parallel launches: {LAUNCH_CONCURRENCY}")
         self._schedule_launches()
 

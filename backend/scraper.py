@@ -4,6 +4,7 @@ Supports live streaming of progressive results (Server-Sent Events)
 and interactive CAPTCHA relay when Cloudflare Turnstile requires user interaction.
 """
 import asyncio
+import os
 import base64
 import uuid
 import time
@@ -31,6 +32,9 @@ SEMESTER_FETCH_CONCURRENCY = 10
 
 # Max seconds from login page load to sign-in, excluding time spent waiting for the user's click
 SECURITY_CHECK_TIMEOUT = 120
+
+# When set, the Turnstile widget is saved there every 10s while it is still verifying (diagnostics)
+TURNSTILE_DEBUG_DIR = os.environ.get("TURNSTILE_DEBUG_DIR", "")
 
 def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
     """Dispatches remote user click coordinates to the corresponding headless browser session."""
@@ -254,6 +258,13 @@ class DIUHeadlessScraper:
                                 if time.monotonic() - last_progress >= 10:
                                     last_progress = time.monotonic()
                                     print(f"[TURNSTILE] {clean_id}: still verifying ({last_progress - wait_started:.0f}s, identical frames={identical})")
+                                    if TURNSTILE_DEBUG_DIR and prev_img:
+                                        try:
+                                            os.makedirs(TURNSTILE_DEBUG_DIR, exist_ok=True)
+                                            with open(os.path.join(TURNSTILE_DEBUG_DIR, f"{session_id[:8]}_{last_progress - wait_started:03.0f}s.png"), "wb") as f:
+                                                f.write(prev_img)
+                                        except OSError:
+                                            pass
                                 token_val = await page.evaluate("""() => {
                                     const el = document.querySelector('[name="cf-turnstile-response"]');
                                     return el && el.value ? el.value : null;
