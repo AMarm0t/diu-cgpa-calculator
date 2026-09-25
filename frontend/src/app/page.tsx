@@ -120,6 +120,30 @@ async function pickServer(avoid?: string): Promise<string> {
   return up[0].base;
 }
 
+// While a login waits in line on one server: another server that has a free slot right now, if any.
+async function freeServerOtherThan(current: string): Promise<string | null> {
+  const answers = await Promise.all(
+    API_BASES.filter((b) => b !== current).map(async (base) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2000);
+      try {
+        const r = await fetch(`${base}/api/capacity`, { signal: ctrl.signal, cache: "no-store" });
+        if (!r.ok) return null;
+        const d = await r.json();
+        return Number(d.free_slots ?? 0) > 0 ? base : null;
+      } catch {
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    })
+  );
+  return answers.find((b) => b !== null) ?? null;
+}
+
+// How many times one login may move to another server while waiting in line (stops ping-pong)
+const MAX_HOPS = 3;
+
 function ThemeToggle({ isDark, onToggle }: { isDark: boolean; onToggle: () => void }) {
   return (
     <button
@@ -348,13 +372,25 @@ export default function Home() {
     clickedRef.current = false;
     setChallengeData(null);
 
+    type Outcome =
+      | { kind: "done" }
+      | { kind: "stalled" }
+      | { kind: "hop"; to: string; from: string; last?: boolean };
+
     // One login attempt. Resolves "stalled" when the server reports that DIU's page froze (a fresh
-    // browser usually works, so the caller retries once); throws on any other failure.
-    const attempt = async (avoid?: string): Promise<"done" | "stalled"> => {
+    // browser usually works, so the caller retries once), "hop" when it should move to a server that
+    // has a free slot; throws on any other failure.
+    // prefer: go straight to this server (a hop); hopFrom: the server a hop left; avoid: see pickServer.
+    const attempt = async (opts: {
+      prefer?: string;
+      hopFrom?: string;
+      avoid?: string;
+      allowHop: boolean;
+    }): Promise<Outcome> => {
       // Choose the least-busy server, then try it; if it can't be reached (network error or the
       // tunnel/gateway is down), fall back to the others in primary-first order. A real answer
       // from a server -- including 429/422 -- is kept, not retried.
-      const first = await pickServer(avoid);
+      const first = opts.prefer ?? (await pickServer(opts.avoid));
       const ordered = [first, ...API_BASES.filter((b) => b !== first)];
       let response: Response | null = null;
       let lastErr: unknown = null;
@@ -383,6 +419,10 @@ export default function Home() {
       void lastErr;
 
       if (response.status === 429) {
+        // A move to a free server was refused: go back to the original one and stay there
+        if (opts.hopFrom && activeApiRef.current !== opts.hopFrom) {
+          return { kind: "hop", to: opts.hopFrom, from: activeApiRef.current, last: true };
+        }
         throw new Error("Too many attempts. Please wait a minute and try again.");
       }
       if (response.status === 422) {
@@ -402,6 +442,44 @@ export default function Home() {
       const idleCheck = setInterval(() => {
         if (Date.now() - lastByteAt > STREAM_IDLE_LIMIT_MS) void reader.cancel().catch(() => {});
       }, 5000);
+
+      // While this login waits in line, keep checking the other servers and move to one that has a
+      // free slot. Logins that arrive in the same second all see the same server free and pick it;
+      // this spreads them out within a second or two. Checks are paced by place in line, so the
+      // front of the line moves first and the others see that slot taken instead of all jumping
+      // to it at once.
+      const here = activeApiRef.current;
+      let waiting = false;
+      let linePosition = 1;
+      const hopCheckDelay = (first: boolean) =>
+        (first ? 300 : 2000) + (linePosition - 1) * 1500 + Math.random() * 400;
+      let hopTo: string | null = null;
+      let hopTimer: ReturnType<typeof setTimeout> | null = null;
+      const stopHopWatch = () => {
+        waiting = false;
+        if (hopTimer) clearTimeout(hopTimer);
+        hopTimer = null;
+      };
+      const watchForFreeServer = (delayMs: number) => {
+        hopTimer = setTimeout(async () => {
+          if (!waiting) return;
+          let free = await freeServerOtherThan(here);
+          if (free && linePosition > 1) {
+            // Someone ahead of us in line is probably moving to that slot too: give them time to
+            // take it, then look again, rather than both leaving and one of us queueing there.
+            await new Promise((r) => setTimeout(r, (linePosition - 1) * 1500));
+            if (!waiting) return;
+            free = await freeServerOtherThan(here);
+          }
+          if (!waiting) return; // our turn came meanwhile
+          if (free) {
+            hopTo = free;
+            void reader.cancel().catch(() => {}); // leaving the line; the server drops our place
+          } else {
+            watchForFreeServer(hopCheckDelay(false));
+          }
+        }, delayMs);
+      };
 
       try {
         while (true) {
@@ -423,7 +501,13 @@ export default function Home() {
               if (payload.type === "queue") {
                 setQueuePosition(payload.position ?? null);
                 setLoadingMsg(payload.message);
+                linePosition = Math.max(1, Number(payload.position) || 1);
+                if (opts.allowHop && API_BASES.length > 1 && !waiting) {
+                  waiting = true;
+                  watchForFreeServer(hopCheckDelay(true));
+                }
               } else if (payload.type === "status") {
+                stopHopWatch(); // out of the line: the login has started here
                 if (payload.step) {
                   setLoginStep(payload.step);
                   if (payload.step !== "connect") setQueuePosition(null);
@@ -454,7 +538,7 @@ export default function Home() {
                 setChallengeData(null);
                 setIsClicking(false);
               } else if (payload.type === "error") {
-                if (payload.code === "stalled") return "stalled";
+                if (payload.code === "stalled") return { kind: "stalled" };
                 throw new Error(payload.message || "Scraping failed.");
               } else if (payload.type === "student") {
                 setChallengeData(null);
@@ -499,26 +583,41 @@ export default function Home() {
           }
         }
       } finally {
+        stopHopWatch();
         clearInterval(idleCheck);
         void reader.cancel().catch(() => {});
       }
+      if (hopTo) return { kind: "hop", to: hopTo, from: here };
       // Ended without a result or an error: the connection dropped mid-login
       if (!finished) throw new Error("Lost connection to the server. Please try again.");
-      return "done";
+      return { kind: "done" };
     };
 
     try {
-      if ((await attempt()) === "stalled") {
+      let next: { prefer?: string; hopFrom?: string; avoid?: string } = {};
+      let hops = 0;
+      let stalls = 0;
+      while (true) {
+        const outcome = await attempt({ ...next, allowHop: hops < MAX_HOPS });
+        if (outcome.kind === "done") break;
+        if (outcome.kind === "hop") {
+          hops = outcome.last ? MAX_HOPS : hops + 1;
+          next = { prefer: outcome.to, hopFrom: outcome.from };
+          setQueuePosition(null);
+          setLoadingMsg("Moving you to a free server...");
+          continue;
+        }
         // DIU's page froze in that server's browser: start over once with a fresh browser,
         // on the other server when it is free.
+        if (++stalls > 1) {
+          throw new Error("DIU's login page stopped responding. Please try again in a minute.");
+        }
         clickedRef.current = false;
         setChallengeData(null);
         setIsClicking(false);
         setLoginStep("connect");
         setLoadingMsg("DIU's page froze - retrying with a fresh browser...");
-        if ((await attempt(activeApiRef.current)) === "stalled") {
-          throw new Error("DIU's login page stopped responding. Please try again in a minute.");
-        }
+        next = { avoid: activeApiRef.current };
       }
     } catch (err: any) {
       setError(err.message || "An unexpected error occurred.");
