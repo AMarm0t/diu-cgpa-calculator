@@ -309,4 +309,6 @@ if __name__ == "__main__":
     print("Frontend should be running at http://localhost:3000")
     # Loopback by default: the Cloudflare tunnel on the same machine reaches it, the network
     # cannot (plain HTTP would expose student passwords). The Docker image sets HOST=0.0.0.0.
-    uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")))
+    # loop="asyncio": under uvloop (uvicorn's Linux default) Playwright element screenshots stall
+    # or time out, so the Turnstile checkbox was never detected as ready (reproduced on the server).
+    uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")), loop="asyncio")
