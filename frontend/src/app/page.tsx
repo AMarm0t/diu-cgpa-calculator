@@ -468,6 +468,7 @@ export default function Home() {
       const decoder = new TextDecoder();
       let buffer = "";
       let finished = false;
+      let serverEnded = false; // the server finished this login itself (result or error)
       let lastByteAt = Date.now();
       const idleCheck = setInterval(() => {
         if (Date.now() - lastByteAt > STREAM_IDLE_LIMIT_MS) void reader.cancel().catch(() => {});
@@ -573,6 +574,7 @@ export default function Home() {
                 setChallengeData(null);
                 setIsClicking(false);
               } else if (payload.type === "error") {
+                serverEnded = true;
                 if (payload.code === "stalled") return { kind: "stalled" };
                 throw new Error(payload.message || "Scraping failed.");
               } else if (payload.type === "student") {
@@ -619,6 +621,10 @@ export default function Home() {
         }
       } finally {
         stopHopWatch();
+        // Ended without an answer from the server: the tab is closing or reloading (the browser
+        // cancels this connection before "pagehide" fires), or the network dropped. Tell the server
+        // so our place in line or slot frees at once instead of ~15s later.
+        if (!finished && !serverEnded && !hopTo && ticket) sendLeave(here, ticket, "left");
         liveLoginRef.current = null;
         clearInterval(idleCheck);
         void reader.cancel().catch(() => {});
