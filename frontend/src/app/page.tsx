@@ -52,7 +52,7 @@ interface ChallengeData {
   };
 }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://direct-occupational-com-fellowship.trycloudflare.com";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://missions-catalog-rendering-checklist.trycloudflare.com";
 
 function ThemeToggle({ isDark, onToggle }: { isDark: boolean; onToggle: () => void }) {
   return (
