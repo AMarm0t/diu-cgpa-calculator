@@ -279,7 +279,10 @@ class DIUHeadlessScraper:
                                     wbox = await widget.bounding_box()
                                     t_box = time.monotonic() - t_step
                                     if wbox and wbox["width"] >= 200 and wbox["height"] >= 40:
-                                        img = await widget.screenshot(timeout=10000)
+                                        # page.screenshot(clip=...) rather than widget.screenshot(): the element
+                                        # variant first waits for the element to be "stable", which on the Linux
+                                        # server hangs forever once the checkbox stops animating.
+                                        img = await page.screenshot(clip={k: wbox[k] for k in ("x", "y", "width", "height")}, timeout=8000)
                                         identical = identical + 1 if img == prev_img else 0
                                         prev_img = img
                                         if TURNSTILE_DEBUG_DIR:
