@@ -157,6 +157,7 @@ const TASK_RESULTS: Record<string, { label: string; cls: string }> = {
   wrong_password: { label: "Wrong password", cls: "bg-amber-950/40 text-amber-300 border-amber-500/30" },
   timeout: { label: "Timed out", cls: "bg-orange-950/40 text-orange-300 border-orange-500/30" },
   click_timeout: { label: "No click", cls: "bg-orange-950/40 text-orange-300 border-orange-500/30" },
+  stalled: { label: "Page froze", cls: "bg-orange-950/40 text-orange-300 border-orange-500/30" },
   cancelled: { label: "Cancelled", cls: "bg-[#1f1f1f] text-[#aaaaaa] border-[#333333]" },
   abandoned: { label: "User left", cls: "bg-[#1f1f1f] text-[#aaaaaa] border-[#333333]" },
   busy: { label: "Server busy", cls: "bg-purple-950/40 text-purple-300 border-purple-500/30" },

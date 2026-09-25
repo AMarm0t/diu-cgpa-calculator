@@ -65,6 +65,9 @@ SPARE_BUILD_MIN_FREE_MB = int(os.getenv("SPARE_BUILD_MIN_FREE_MB", "700"))
 # How long a login waits for a queued browser before launching its own as a fallback.
 SPARE_WAIT_TIMEOUT = 60
 
+# Seconds to wait for a browser to close before killing it.
+CLOSE_TIMEOUT = 15
+
 # Throwaway profile dirs live here; leftovers from a crash are wiped at startup.
 PROFILE_ROOT = os.path.abspath(os.getenv("BROWSER_PROFILE_ROOT", "./browser_profiles/tmp"))
 
@@ -113,6 +116,22 @@ def _kill_orphaned_xvfb():
         print(f"[BROWSER] Cleaned up {killed} orphaned virtual display(s)")
 
 
+def _kill_by_profile(profile_dir: str):
+    """SIGKILLs this user's processes whose command line names profile_dir (one login's browser)."""
+    if not sys.platform.startswith("linux"):
+        return
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read()
+            if profile_dir.encode() in cmdline and os.stat(f"/proc/{pid}").st_uid == os.getuid():
+                os.kill(int(pid), signal.SIGKILL)
+        except OSError:
+            pass
+
+
 @dataclass
 class _Warm:
     context: BrowserContext
@@ -133,6 +152,7 @@ class BrowserPool:
         self._inflight = 0   # background launches that will land in _ready
         self._waiters = 0    # logins blocked on _ready.get()
         self._in_use = 0
+        self._closing: set[asyncio.Task] = set()  # detached closes, kept referenced until done
         self._stopped = False
 
     async def start(self):
@@ -202,11 +222,30 @@ class BrowserPool:
     @staticmethod
     async def _close(warm: _Warm):
         try:
-            await warm.context.close()
-        except Exception:
-            pass
+            await asyncio.wait_for(warm.context.close(), timeout=CLOSE_TIMEOUT)
+        except Exception as e:
+            # A frozen browser may never answer; kill it so its RAM comes back
+            print(f"[BROWSER] Close failed ({type(e).__name__}) - killing the browser")
+            await asyncio.to_thread(_kill_by_profile, warm.profile_dir)
         # Deleting the profile guarantees no student's Keycloak session survives into the next login
         await asyncio.to_thread(shutil.rmtree, warm.profile_dir, True)
+
+    def _close_detached(self, warm: _Warm):
+        """
+        Closes a browser in its own task. A login's cleanup runs while the request is being
+        cancelled (the visitor left), and Starlette's cancellation interrupts every await in it,
+        which used to skip the close and leave the profile (with the student's session) behind.
+        """
+        task = asyncio.create_task(self._close_and_reschedule(warm))
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
+        return task
+
+    async def _close_and_reschedule(self, warm: _Warm):
+        try:
+            await self._close(warm)
+        finally:
+            self._schedule_launches()  # replace the spare as soon as this login's RAM is freed
 
     def _spare_build_allowed(self) -> bool:
         """
@@ -270,9 +309,10 @@ class BrowserPool:
         try:
             yield warm.page
         finally:
-            await self._close(warm)
             self._in_use -= 1
-            self._schedule_launches()  # otherwise replace it as soon as this login's RAM is freed
+            # Waits for the close when it can; if this login is being cancelled the close still
+            # finishes in the background.
+            await asyncio.shield(self._close_detached(warm))
 
     def status(self) -> dict:
         return {

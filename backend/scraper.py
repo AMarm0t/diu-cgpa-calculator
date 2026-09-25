@@ -15,7 +15,7 @@ from urllib.parse import urlparse, parse_qs
 import httpx
 from PIL import Image
 import db
-from browser_pool import browser_pool, WARM_BROWSERS
+from browser_pool import browser_pool, WARM_BROWSERS, SPARE_WAIT_TIMEOUT
 from queue_manager import queue_manager, QueueCancelledException, QueueFullException, QueueTimeoutException
 import task_history
 from cgpa_calculator import calculate_overall_cgpa
@@ -42,6 +42,13 @@ CLICK_TIMEOUT = 90
 
 # Hard cap on the whole browser phase (security check + sign-in), whatever else happens
 MAX_BROWSER_PHASE_SECONDS = 240
+
+# Seconds of stream silence before a keep-alive comment is sent
+HEARTBEAT_SECONDS = 10
+
+# The browser phase marks itself alive at least this often while healthy; past it the page is
+# considered frozen and the login is aborted (see DIUHeadlessScraper._watched)
+STALL_SECONDS = 40
 
 # Live view stuck on the "Verifying..." spinner: nudge a repaint, then reload the page for a fresh check
 SPINNER_NUDGE_AFTER = 12
@@ -77,6 +84,21 @@ def looks_like_spinner(png: bytes) -> bool:
     return green > 15
 
 
+_detached: set[asyncio.Future] = set()
+
+
+def _detach(fut: asyncio.Future):
+    """Keeps a background task referenced until it finishes, and swallows its outcome."""
+    _detached.add(fut)
+
+    def done(f: asyncio.Future):
+        _detached.discard(f)
+        if not f.cancelled():
+            f.exception()  # retrieved, so asyncio doesn't log "exception was never retrieved"
+
+    fut.add_done_callback(done)
+
+
 def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
     """Dispatches remote user click coordinates to the corresponding headless browser session."""
     session = active_browser_sessions.get(session_id)
@@ -101,9 +123,10 @@ class DIUHeadlessScraper:
             "source": "live", "result": None, "stage": "connect", "message": "", "captcha_shown": 0,
             "clicks": 0, "semesters": 0, "queue_wait_s": 0.0,
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "stall_deadline": None,  # set by the browser phase; see _watched
         }
         try:
-            async for event in self._scrape_stream_inner(student_id, password, task):
+            async for event in self._watched(self._scrape_stream_inner(student_id, password, task), task):
                 etype = event.get("type")
                 if etype == "status" and event.get("step"):
                     task["stage"] = event["step"]
@@ -129,7 +152,51 @@ class DIUHeadlessScraper:
             task["result"] = task["result"] or "abandoned"
             task["duration_s"] = round(time.monotonic() - started, 1)
             task["finished_at"] = datetime.now(timezone.utc).isoformat()
+            task.pop("stall_deadline", None)
             task_history.record(task)  # local SQLite insert, a few ms; safe during generator close
+
+    @staticmethod
+    async def _watched(inner, task: dict):
+        """
+        Runs the login generator in its own task and relays its events, adding:
+        - {"type": "heartbeat"} every HEARTBEAT_SECONDS of silence, so proxies (Cloudflare drops
+          a response idle for ~100s) keep the stream open while the user thinks or waits in line;
+        - a watchdog: once the browser phase stops showing signs of life (task["stall_deadline"]
+          passes, e.g. a Playwright call hanging on a frozen page) the login is cancelled and a
+          "stalled" error is sent, instead of leaving the user on a spinner.
+        Its own task also keeps the login's cleanup (closing the browser, freeing the slot) whole
+        when the visitor leaves: Starlette's cancellation would interrupt every await in it.
+        """
+        step = None
+        try:
+            while True:
+                if step is None:
+                    step = asyncio.ensure_future(inner.__anext__())
+                done, _ = await asyncio.wait({step}, timeout=HEARTBEAT_SECONDS)
+                if not done:
+                    deadline = task.get("stall_deadline")
+                    if deadline is not None and time.monotonic() > deadline:
+                        print(f"[WATCHDOG] {task['student_id']}: browser stopped responding (stage {task['stage']}) - aborting")
+                        yield {"type": "error", "code": "stalled",
+                               "message": "DIU's login page stopped responding. Please try again."}
+                        return  # the finally cancels the login; its cleanup runs on in that task
+                    yield {"type": "heartbeat"}
+                    continue
+                try:
+                    event = step.result()
+                except StopAsyncIteration:
+                    step = None
+                    return
+                step = None
+                yield event
+        finally:
+            if step is not None and not step.done():
+                step.cancel()  # stalled, or the visitor left mid-step
+                _detach(step)
+            else:
+                if step is not None:
+                    _detach(step)  # finished but unread
+                _detach(asyncio.ensure_future(inner.aclose()))  # suspended at a yield, or finished
 
     async def _scrape_stream_inner(self, student_id: str, password: str, task: dict):
         clean_id = student_id.strip()
@@ -238,10 +305,15 @@ class DIUHeadlessScraper:
             active_browser_sessions.pop(session_id, None)
             raise
 
+        def alive(seconds: float = STALL_SECONDS):
+            """Marks the browser phase healthy; the watchdog aborts if the next mark comes later than this."""
+            task["stall_deadline"] = time.monotonic() + seconds
+
         try:
             # Step 1: Login in a dedicated pre-warmed Camoufox browser
             t_launch = time.monotonic()
             hard_deadline = t_launch + MAX_BROWSER_PHASE_SECONDS
+            alive(SPARE_WAIT_TIMEOUT + 60)  # may wait for a browser, then launch one
             if not browser_pool.has_ready_browser():
                 msg = ("Starting a secure browser for you (~10s)..." if WARM_BROWSERS == 0
                        else "Busy moment - starting a secure browser for you (~10s)...")
@@ -274,6 +346,7 @@ class DIUHeadlessScraper:
                 page.on("framenavigated", lambda frame: check_url(frame.url))
 
                 try:
+                    alive(130)  # the page load below is bounded by its own timeouts
                     yield {"type": "status", "step": "verify", "message": "Passing security verification..."}
                     # Fast commit navigation prevents dropping connections on slow external assets
                     try:
@@ -297,6 +370,7 @@ class DIUHeadlessScraper:
 
                     # Loop through challenge and login steps
                     for attempt in range(45):
+                        alive()
                         check_url(page.url)
                         if auth_code:
                             break
@@ -349,6 +423,7 @@ class DIUHeadlessScraper:
                             reloads = 0
                             verifying_announced = False
                             while True:
+                                alive()
                                 now = time.monotonic()
                                 # Until something is shown the security-check deadline applies; once the user
                                 # can see the widget they get CLICK_TIMEOUT to act.
@@ -384,6 +459,7 @@ class DIUHeadlessScraper:
                                                 reloads += 1
                                                 print(f"[TURNSTILE] {clean_id}: spinner stuck {stuck_for:.0f}s - reloading the login page ({reloads}/{MAX_WIDGET_RELOADS})")
                                                 yield {"type": "status", "step": "verify", "message": "Security check got stuck - refreshing it..."}
+                                                alive(90)  # reload + selector wait are bounded themselves
                                                 await page.reload(wait_until="commit", timeout=45000)
                                                 await page.wait_for_selector('input#username, #kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]', timeout=30000)
                                                 widget = page.locator('#kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]').first
@@ -471,6 +547,7 @@ class DIUHeadlessScraper:
                                     url_before_click = page.url
                                     solved = False
                                     for _ in range(30):
+                                        alive()
                                         await page.wait_for_timeout(300)
                                         check_url(page.url)
                                         if auth_code or page.url != url_before_click:
@@ -538,6 +615,7 @@ class DIUHeadlessScraper:
                     yield {"type": "error", "code": "network", "message": "Could not reach the DIU login page. Please try again."}
                     return
         finally:
+            task["stall_deadline"] = None  # the gateway phase has its own request timeouts
             active_browser_sessions.pop(session_id, None)
             if queue_id:
                 await queue_manager.release(queue_id)

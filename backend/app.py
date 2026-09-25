@@ -212,7 +212,10 @@ async def scrape_stream_endpoint(request: ScrapeRequest, http_request: Request, 
         yield f": {' ' * 2048}\n\n"
         try:
             async for item in scraper.scrape_stream(request.student_id.strip(), request.password.strip(), client_ip(http_request)):
-                yield f"data: {json.dumps(item)}\n\n"
+                if item.get("type") == "heartbeat":
+                    yield ": ping\n\n"  # SSE comment: keeps proxies from closing a quiet stream
+                else:
+                    yield f"data: {json.dumps(item)}\n\n"
         except Exception as e:
             print(f"[STREAM] Unhandled scrape error: {e!r}")
             yield f"data: {json.dumps({'type': 'error', 'message': 'Something went wrong. Please try again.'})}\n\n"

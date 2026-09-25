@@ -64,10 +64,15 @@ const API_BASES = (
   .filter(Boolean);
 const API_BASE = API_BASES[0];
 
+// The server sends a keep-alive at least every 10s during a login; this long without a single
+// byte means the connection is dead (network drop, proxy timeout) and waiting longer is pointless.
+const STREAM_IDLE_LIMIT_MS = 45000;
+
 // Picks which server should handle a new login. Prefers a server with a free slot (a login can
 // start at once), choosing a warm one and the primary on ties; otherwise the shortest queue.
 // A server that doesn't answer its capacity check within 2.5s is treated as down and skipped.
-async function pickServer(): Promise<string> {
+// `avoid` (a server whose browser just froze) is only chosen when it is clearly the better option.
+async function pickServer(avoid?: string): Promise<string> {
   if (API_BASES.length === 1) return API_BASES[0];
   const probes = await Promise.all(
     API_BASES.map(async (base, index) => {
@@ -94,10 +99,12 @@ async function pickServer(): Promise<string> {
   if (up.length === 0) return API_BASES[0]; // none answered; the request path will try failover
   const free = up.filter((s) => s.free > 0);
   if (free.length > 0) {
-    free.sort((a, b) => Number(b.ready) - Number(a.ready) || a.index - b.index);
+    free.sort((a, b) =>
+      Number(a.base === avoid) - Number(b.base === avoid) || Number(b.ready) - Number(a.ready) || a.index - b.index
+    );
     return free[0].base;
   }
-  up.sort((a, b) => a.waiting - b.waiting || a.index - b.index);
+  up.sort((a, b) => a.waiting - b.waiting || Number(a.base === avoid) - Number(b.base === avoid) || a.index - b.index);
   return up[0].base;
 }
 
@@ -328,11 +335,13 @@ export default function Home() {
     clickedRef.current = false;
     setChallengeData(null);
 
-    try {
+    // One login attempt. Resolves "stalled" when the server reports that DIU's page froze (a fresh
+    // browser usually works, so the caller retries once); throws on any other failure.
+    const attempt = async (avoid?: string): Promise<"done" | "stalled"> => {
       // Choose the least-busy server, then try it; if it can't be reached (network error or the
       // tunnel/gateway is down), fall back to the others in primary-first order. A real answer
       // from a server -- including 429/422 -- is kept, not retried.
-      const first = await pickServer();
+      const first = await pickServer(avoid);
       const ordered = [first, ...API_BASES.filter((b) => b !== first)];
       let response: Response | null = null;
       let lastErr: unknown = null;
@@ -375,96 +384,127 @@ export default function Home() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let finished = false;
+      let lastByteAt = Date.now();
+      const idleCheck = setInterval(() => {
+        if (Date.now() - lastByteAt > STREAM_IDLE_LIMIT_MS) void reader.cancel().catch(() => {});
+      }, 5000);
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          lastByteAt = Date.now();
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop() || "";
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n\n");
+          buffer = lines.pop() || "";
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data:")) continue;
 
-          try {
-            const payload = JSON.parse(trimmed.replace(/^data:\s*/, ""));
+            try {
+              const payload = JSON.parse(trimmed.replace(/^data:\s*/, ""));
 
-            if (payload.type === "queue") {
-              setQueuePosition(payload.position ?? null);
-              setLoadingMsg(payload.message);
-            } else if (payload.type === "status") {
-              if (payload.step) {
-                setLoginStep(payload.step);
-                if (payload.step !== "connect") setQueuePosition(null);
-              }
-              setLoadingMsg(payload.message);
-            } else if (payload.type === "challenge_required") {
-              // After a click the popup stays closed; a frame that was already on its way must not
-              // reopen it. Only a challenge_retry (Cloudflare wants another click) re-arms it.
-              if (!clickedRef.current) {
+              if (payload.type === "queue") {
+                setQueuePosition(payload.position ?? null);
+                setLoadingMsg(payload.message);
+              } else if (payload.type === "status") {
+                if (payload.step) {
+                  setLoginStep(payload.step);
+                  if (payload.step !== "connect") setQueuePosition(null);
+                }
+                setLoadingMsg(payload.message);
+              } else if (payload.type === "challenge_required") {
+                // After a click the popup stays closed; a frame that was already on its way must not
+                // reopen it. Only a challenge_retry (Cloudflare wants another click) re-arms it.
+                if (!clickedRef.current) {
+                  if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+                  setChallengeData({
+                    sessionId: payload.session_id,
+                    image: payload.image,
+                    box: payload.box || { x: 0, y: 0, width: 300, height: 65 }
+                  });
+                  setIsClicking(false);
+                }
+              } else if (payload.type === "challenge_retry") {
+                // The screenshot is stale; close the modal until the backend sends a fresh challenge_required
                 if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
-                setChallengeData({
-                  sessionId: payload.session_id,
-                  image: payload.image,
-                  box: payload.box || { x: 0, y: 0, width: 300, height: 65 }
-                });
+                clickedRef.current = false;
+                setChallengeData(null);
                 setIsClicking(false);
+                setLoadingMsg(payload.message || "Please click the checkbox again.");
+              } else if (payload.type === "challenge_solved") {
+                if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+                clickedRef.current = false;
+                setChallengeData(null);
+                setIsClicking(false);
+              } else if (payload.type === "error") {
+                if (payload.code === "stalled") return "stalled";
+                throw new Error(payload.message || "Scraping failed.");
+              } else if (payload.type === "student") {
+                setChallengeData(null);
+                setData({
+                  student: payload.data,
+                  overall_cgpa: 0.0,
+                  total_credits: 0.0,
+                  total_completed_credits: 0.0,
+                  semesters: []
+                });
+                setIsLoading(false);
+              } else if (payload.type === "semester") {
+                setData((prev) => {
+                  if (!prev) return null;
+                  const existing = prev.semesters.filter(s => s.name !== payload.data.name);
+                  return {
+                    ...prev,
+                    overall_cgpa: payload.running_cgpa,
+                    total_credits: payload.total_credits,
+                    total_completed_credits: payload.completed_credits,
+                    semesters: [...existing, payload.data]
+                  };
+                });
+              } else if (payload.type === "complete") {
+                setData((prev) => {
+                  if (!prev) return null;
+                  return {
+                    ...prev,
+                    overall_cgpa: payload.overall_cgpa,
+                    total_credits: payload.total_credits,
+                    total_completed_credits: payload.total_completed_credits
+                  };
+                });
+                setIsStreaming(false);
+                finished = true;
               }
-            } else if (payload.type === "challenge_retry") {
-              // The screenshot is stale; close the modal until the backend sends a fresh challenge_required
-              if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
-              clickedRef.current = false;
-              setChallengeData(null);
-              setIsClicking(false);
-              setLoadingMsg(payload.message || "Please click the checkbox again.");
-            } else if (payload.type === "challenge_solved") {
-              if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
-              clickedRef.current = false;
-              setChallengeData(null);
-              setIsClicking(false);
-            } else if (payload.type === "error") {
-              throw new Error(payload.message || "Scraping failed.");
-            } else if (payload.type === "student") {
-              setChallengeData(null);
-              setData({
-                student: payload.data,
-                overall_cgpa: 0.0,
-                total_credits: 0.0,
-                total_completed_credits: 0.0,
-                semesters: []
-              });
-              setIsLoading(false);
-            } else if (payload.type === "semester") {
-              setData((prev) => {
-                if (!prev) return null;
-                const existing = prev.semesters.filter(s => s.name !== payload.data.name);
-                return {
-                  ...prev,
-                  overall_cgpa: payload.running_cgpa,
-                  total_credits: payload.total_credits,
-                  total_completed_credits: payload.completed_credits,
-                  semesters: [...existing, payload.data]
-                };
-              });
-            } else if (payload.type === "complete") {
-              setData((prev) => {
-                if (!prev) return null;
-                return {
-                  ...prev,
-                  overall_cgpa: payload.overall_cgpa,
-                  total_credits: payload.total_credits,
-                  total_completed_credits: payload.total_completed_credits
-                };
-              });
-              setIsStreaming(false);
-            }
-          } catch (jsonErr: any) {
-            if (jsonErr.message && !jsonErr.message.includes("Unexpected token")) {
-              throw jsonErr;
+            } catch (jsonErr: any) {
+              if (jsonErr.message && !jsonErr.message.includes("Unexpected token")) {
+                throw jsonErr;
+              }
             }
           }
+        }
+      } finally {
+        clearInterval(idleCheck);
+        void reader.cancel().catch(() => {});
+      }
+      // Ended without a result or an error: the connection dropped mid-login
+      if (!finished) throw new Error("Lost connection to the server. Please try again.");
+      return "done";
+    };
+
+    try {
+      if ((await attempt()) === "stalled") {
+        // DIU's page froze in that server's browser: start over once with a fresh browser,
+        // on the other server when it is free.
+        clickedRef.current = false;
+        setChallengeData(null);
+        setIsClicking(false);
+        setLoginStep("connect");
+        setLoadingMsg("DIU's page froze - retrying with a fresh browser...");
+        if ((await attempt(activeApiRef.current)) === "stalled") {
+          throw new Error("DIU's login page stopped responding. Please try again in a minute.");
         }
       }
     } catch (err: any) {
