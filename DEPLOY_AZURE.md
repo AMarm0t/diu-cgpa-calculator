@@ -64,16 +64,43 @@ reachable by the tunnel on the same VM but not from the internet.
 
 ---
 
-## Part 3: HTTPS via Cloudflare Tunnel
+## Part 3: HTTPS via a named Cloudflare Tunnel (permanent address)
 
-```bash
-# x86 VMs (B1s, B2ats_v2). For the Arm size (B2pts_v2) use cloudflared-linux-arm64.deb
-wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-sudo dpkg -i cloudflared-linux-amd64.deb
-cloudflared tunnel --url http://localhost:8000
-```
-It prints a free `https://<random>.trycloudflare.com` URL. Quick-tunnel URLs change on restart;
-for a stable URL, create a named tunnel on a domain you control in Cloudflare.
+The domain's DNS is managed by Cloudflare (nameservers changed at the registrar; the Vercel
+records `@ A 76.76.21.21` and `www CNAME cname.vercel-dns.com` are **DNS only**, grey cloud).
+
+1. Install cloudflared on the VM:
+   ```bash
+   # x86 VMs (B1s, B2ats_v2). For the Arm size (B2pts_v2) use cloudflared-linux-arm64.deb
+   wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+   sudo dpkg -i cloudflared-linux-amd64.deb
+   ```
+2. Cloudflare dashboard → **Tunnels** → **Create a tunnel** → Cloudflared → name `diu-backend`.
+   Copy only the `eyJ...` token from the install command into `~/.cloudflared-token`
+   (one line), then `chmod 600 ~/.cloudflared-token`. Never commit or share the token.
+3. Run it as a service that starts at boot:
+   ```bash
+   sudo tee /etc/systemd/system/cloudflared-named.service > /dev/null <<'EOF'
+   [Unit]
+   Description=Cloudflare named tunnel (api.resultscraper.app)
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   User=azureuser
+   ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token-file /home/azureuser/.cloudflared-token
+   Restart=always
+   RestartSec=5
+
+   [Install]
+   WantedBy=multi-user.target
+   EOF
+   sudo systemctl daemon-reload && sudo systemctl enable --now cloudflared-named
+   ```
+4. In the tunnel's **Routes**, add a published application: `api` . `resultscraper.app` →
+   `http://127.0.0.1:8000` (not `localhost`: the backend listens on 127.0.0.1 only).
+
+The backend is then always at `https://api.resultscraper.app`, including after reboots.
 
 ---
 
@@ -81,7 +108,7 @@ for a stable URL, create a named tunnel on a domain you control in Cloudflare.
 
 1. Import the repository in [Vercel](https://vercel.com), **Root Directory** = `frontend`.
 2. **Environment Variables** (Project → Settings → Environment Variables):
-   - `NEXT_PUBLIC_API_URL` = your tunnel URL
+   - `NEXT_PUBLIC_API_URL` = `https://api.resultscraper.app`
    - `NEXT_PUBLIC_GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_ID` = your OAuth client ID
    - `GOOGLE_CLIENT_SECRET` = your OAuth client secret
    - `NEXTAUTH_URL` = your Vercel URL
