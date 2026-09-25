@@ -623,7 +623,7 @@ export default function Home() {
                   <label className={`block mb-2 ${
                     isDark ? "text-xs font-mono uppercase tracking-wider text-[#888888]" : "text-sm font-medium text-slate-700"
                   }`}>
-                    Student ID
+                    Student ID or Registration ID
                   </label>
                   <input
                     type="text"
@@ -633,7 +633,6 @@ export default function Home() {
                         ? "bg-[#101010] border-[#2b2b2b] text-white font-mono placeholder-[#555555] focus:border-[#3ecf8e] focus:ring-1 focus:ring-[#3ecf8e]"
                         : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
                     }`}
-                    placeholder="xxx-xx-xxx or full ID number"
                     maxLength={24}
                     autoComplete="username"
                     value={studentId}
@@ -645,7 +644,7 @@ export default function Home() {
                   <label className={`block mb-2 ${
                     isDark ? "text-xs font-mono uppercase tracking-wider text-[#888888]" : "text-sm font-medium text-slate-700"
                   }`}>
-                    Portal Password
+                    Student Portal Password
                   </label>
                   <div className="relative">
                     <input
@@ -656,7 +655,6 @@ export default function Home() {
                           ? "bg-[#101010] border-[#2b2b2b] text-white font-mono placeholder-[#555555] focus:border-[#3ecf8e] focus:ring-1 focus:ring-[#3ecf8e]"
                           : "bg-white border-slate-300 text-slate-900 focus:ring-2 focus:ring-teal-500 focus:border-teal-500"
                       }`}
-                      placeholder="••••••••"
                       maxLength={64}
                       autoComplete="current-password"
                       autoCapitalize="off"

@@ -1245,10 +1245,9 @@ export default function AdminPage() {
 
                   <form onSubmit={handleAdminScrape} className="space-y-4 pt-2">
                     <div className="space-y-1.5">
-                      <label className="text-xs font-mono text-[#888888]">Student ID</label>
+                      <label className="text-xs font-mono text-[#888888]">Student ID or Registration ID</label>
                       <input
                         type="text"
-                        placeholder="xxx-xx-xxx or full ID number"
                         maxLength={24}
                         value={scrapeStudentId}
                         onChange={(e) => setScrapeStudentId(e.target.value)}
@@ -1259,10 +1258,9 @@ export default function AdminPage() {
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="text-xs font-mono text-[#888888]">Student Password</label>
+                      <label className="text-xs font-mono text-[#888888]">Student Portal Password</label>
                       <input
                         type="password"
-                        placeholder="Portal Password"
                         maxLength={64}
                         value={scrapePassword}
                         onChange={(e) => setScrapePassword(e.target.value)}
