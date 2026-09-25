@@ -34,7 +34,15 @@ SEMESTER_FETCH_CONCURRENCY = 10
 # Max seconds from login page load to sign-in, excluding time spent waiting for the user's click
 SECURITY_CHECK_TIMEOUT = 120
 
-# When set, the Turnstile widget is saved there every 10s while it is still verifying (diagnostics)
+# Seconds the user has to click once the live view of the security check is on screen
+CLICK_TIMEOUT = 90
+
+TOKEN_JS = """() => {
+    const el = document.querySelector('[name="cf-turnstile-response"]');
+    return el && el.value ? el.value : null;
+}"""
+
+# When set, extra per-step Turnstile diagnostics are logged
 TURNSTILE_DEBUG_DIR = os.environ.get("TURNSTILE_DEBUG_DIR", "")
 
 def dispatch_remote_click(session_id: str, x: float, y: float) -> bool:
@@ -244,146 +252,109 @@ class DIUHeadlessScraper:
 
                         # If Turnstile is active and not yet solved:
                         if has_turnstile and not token_val:
-                            # Wait until Turnstile either passes on its own or settles on the interactive
-                            # checkbox, then show it immediately. While "Verifying..." the spinner animates,
-                            # so consecutive widget screenshots differ; identical shots mean it has settled.
-                            # (The iframe HTML always contains the word "verifying", so it can't be used.)
-                            settled_img = None
-                            prev_img = None
-                            identical = 0
-                            wait_started = last_progress = time.monotonic()
-                            while time.monotonic() < phase_deadline:
+                            # Live view: stream the widget to the user whenever it changes, until they click
+                            # or Turnstile passes by itself. No "is it the checkbox yet?" guessing: on the
+                            # Linux server the browser's painting stalls at random for ~15s, which broke every
+                            # settle-detection approach; a live view just lags a moment instead.
+                            session_event.clear()
+                            active_browser_sessions[session_id]["click_coords"] = None
+                            last_hash = None
+                            shown_at = None
+                            clicked = False
+                            while True:
+                                now = time.monotonic()
+                                # Until something is shown the security-check deadline applies; once the user
+                                # can see the widget they get CLICK_TIMEOUT to act.
+                                if (shown_at is None and now > phase_deadline) or (shown_at is not None and now - shown_at > CLICK_TIMEOUT):
+                                    break
                                 check_url(page.url)
                                 if auth_code:
                                     break
-                                if time.monotonic() - last_progress >= 10:
-                                    last_progress = time.monotonic()
-                                    print(f"[TURNSTILE] {clean_id}: still verifying ({last_progress - wait_started:.0f}s, identical frames={identical})")
-                                    if TURNSTILE_DEBUG_DIR and prev_img:
-                                        try:
-                                            os.makedirs(TURNSTILE_DEBUG_DIR, exist_ok=True)
-                                            with open(os.path.join(TURNSTILE_DEBUG_DIR, f"{session_id[:8]}_{last_progress - wait_started:03.0f}s.png"), "wb") as f:
-                                                f.write(prev_img)
-                                        except OSError:
-                                            pass
-                                token_val = await page.evaluate("""() => {
-                                    const el = document.querySelector('[name="cf-turnstile-response"]');
-                                    return el && el.value ? el.value : null;
-                                }""")
-                                if token_val:
-                                    break
-                                if await widget.count() == 0:
-                                    break  # page moved on without needing the widget
-                                t_step = time.monotonic()
                                 try:
-                                    wbox = await widget.bounding_box()
-                                    t_box = time.monotonic() - t_step
-                                    if wbox and wbox["width"] >= 200 and wbox["height"] >= 40:
-                                        img = await widget.screenshot(timeout=10000)
-                                        identical = identical + 1 if img == prev_img else 0
-                                        prev_img = img
-                                        if TURNSTILE_DEBUG_DIR:
-                                            print(f"[TSDEBUG] {clean_id}: box {t_box:.1f}s shot {time.monotonic() - t_step - t_box:.1f}s hash {hashlib.md5(img).hexdigest()[:6]} identical={identical}")
-                                        if identical >= 2:
-                                            settled_img = img
-                                            break
-                                    elif TURNSTILE_DEBUG_DIR:
-                                        print(f"[TSDEBUG] {clean_id}: box {t_box:.1f}s unusable box={wbox}")
+                                    token_val = await page.evaluate(TOKEN_JS)
+                                    if token_val or await widget.count() == 0:
+                                        break  # passed by itself, or the page moved on
+                                    box = await widget.bounding_box()
+                                    if box and box["width"] >= 200 and box["height"] >= 40:
+                                        img = await page.screenshot(clip={k: box[k] for k in ("x", "y", "width", "height")}, timeout=8000)
+                                        frame_hash = hashlib.md5(img).hexdigest()
+                                        if frame_hash != last_hash:
+                                            last_hash = frame_hash
+                                            active_browser_sessions[session_id]["box"] = box
+                                            if shown_at is None:
+                                                shown_at = time.monotonic()
+                                                print(f"[TURNSTILE] {clean_id}: live view started ({shown_at - t_launch:.1f}s)")
+                                            yield {
+                                                "type": "challenge_required",
+                                                "session_id": session_id,
+                                                "image": "data:image/png;base64," + base64.b64encode(img).decode("utf-8"),
+                                                "box": box,
+                                            }
                                 except Exception as exc:
-                                    # A slow/frozen browser (low-RAM server) times out a screenshot now and
-                                    # then; keep the streak instead of resetting it, or it never settles.
                                     if TURNSTILE_DEBUG_DIR:
-                                        print(f"[TSDEBUG] {clean_id}: {type(exc).__name__} after {time.monotonic() - t_step:.1f}s: {str(exc).splitlines()[0][:120]}")
-                                await page.wait_for_timeout(300)
+                                        print(f"[TSDEBUG] {clean_id}: {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
+                                try:
+                                    await asyncio.wait_for(session_event.wait(), timeout=1.5)
+                                    clicked = True
+                                    break
+                                except asyncio.TimeoutError:
+                                    pass
 
                             if auth_code:
                                 break
 
-                            if settled_img is not None and not token_val:
-                                try:
-                                    box = await widget.bounding_box()
-                                    if box and box["width"] > 0 and box["height"] > 0:
-                                        active_browser_sessions[session_id]["box"] = box
-                                        img_bytes = settled_img
-                                        img_b64 = "data:image/png;base64," + base64.b64encode(img_bytes).decode('utf-8')
+                            if not clicked:
+                                if token_val and shown_at is not None:
+                                    yield {"type": "challenge_solved"}  # passed without a click: close the modal
+                                elif not token_val and shown_at is not None:
+                                    print(f"[TURNSTILE] {clean_id}: no click within {CLICK_TIMEOUT}s")
+                                    yield {"type": "error", "message": "Verification timed out. Please try again."}
+                                    return
+                                # otherwise nothing was shown before the deadline; the loop top reports it
+                            else:
+                                t_clicked = time.monotonic()
+                                phase_deadline += t_clicked - shown_at  # the user's thinking time doesn't count
+                                coords = active_browser_sessions[session_id].get("click_coords")
+                                if coords:
+                                    try:
+                                        click_x = float(coords["x"])
+                                        click_y = float(coords["y"])
+                                        await page.mouse.move(click_x, click_y, steps=10)
+                                        await page.mouse.down()
+                                        await page.wait_for_timeout(100)
+                                        await page.mouse.up()
+                                    except Exception as exc:
+                                        print(f"[TURNSTILE] {clean_id}: click failed: {exc!r}")
 
-                                        session_event.clear()
-                                        active_browser_sessions[session_id]["click_coords"] = None
+                                    yield {"type": "status", "message": "Verification received. Processing..."}
 
-                                        print(f"[TURNSTILE] {clean_id}: interactive checkbox shown to user ({time.monotonic() - t_launch:.1f}s)")
-                                        yield {
-                                            "type": "challenge_required",
-                                            "session_id": session_id,
-                                            "image": img_b64,
-                                            "box": box,
-                                        }
-
-                                        # Wait for user click from website modal
+                                    # Poll for resolution (every 300ms, up to 10s). A solved Turnstile often
+                                    # navigates straight to the login form, which removes the token input and
+                                    # destroys the JS context -- both mean success, not "pending".
+                                    url_before_click = page.url
+                                    solved = False
+                                    for _ in range(30):
+                                        await page.wait_for_timeout(300)
+                                        check_url(page.url)
+                                        if auth_code or page.url != url_before_click:
+                                            solved = True
+                                            break
                                         try:
-                                            t_shown = time.monotonic()
-                                            await asyncio.wait_for(session_event.wait(), timeout=60.0)
-                                            t_clicked = time.monotonic()
-                                            phase_deadline += t_clicked - t_shown  # the user's thinking time doesn't count
-                                            coords = active_browser_sessions[session_id].get("click_coords")
-                                            if coords:
-                                                click_x = float(coords["x"])
-                                                click_y = float(coords["y"])
-                                                await page.mouse.move(click_x, click_y, steps=10)
-                                                await page.mouse.down()
-                                                await page.wait_for_timeout(100)
-                                                await page.mouse.up()
+                                            token_val = await page.evaluate(TOKEN_JS)
+                                            widget_gone = await page.locator('#kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]').count() == 0
+                                        except Exception:
+                                            solved = True  # execution context destroyed by navigation
+                                            break
+                                        if token_val or widget_gone:
+                                            solved = True
+                                            break
 
-                                                # Also trigger click on cf_frame checkbox if accessible
-                                                for f in page.frames:
-                                                    if "challenges.cloudflare.com" in f.url:
-                                                        try:
-                                                            cb = f.locator('input[type="checkbox"], label, .ctp-checkbox-label, #challenge-stage').first
-                                                            if await cb.count() > 0:
-                                                                await cb.click(timeout=1500)
-                                                        except Exception:
-                                                            pass
-                                                        break
-
-                                                yield {"type": "status", "message": "Verification received. Processing..."}
-                                                
-                                                # Fast poll for resolution (every 300ms, up to 10s). A solved Turnstile
-                                                # often navigates straight to the login form, which removes the token
-                                                # input and destroys the JS context -- both mean success, not "pending".
-                                                url_before_click = page.url
-                                                solved = False
-                                                for _ in range(30):
-                                                    await page.wait_for_timeout(300)
-                                                    check_url(page.url)
-                                                    if auth_code or page.url != url_before_click:
-                                                        solved = True
-                                                        break
-                                                    try:
-                                                        token_val = await page.evaluate("""() => {
-                                                            const el = document.querySelector('[name="cf-turnstile-response"]');
-                                                            return el && el.value ? el.value : null;
-                                                        }""")
-                                                        widget_gone = await page.locator('#kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]').count() == 0
-                                                    except Exception:
-                                                        # Execution context destroyed by navigation
-                                                        solved = True
-                                                        break
-                                                    if token_val or widget_gone:
-                                                        solved = True
-                                                        break
-
-                                                print(f"[TURNSTILE] {clean_id}: user clicked at {t_clicked - t_launch:.1f}s -> {'solved' if solved else 'still pending'} at {time.monotonic() - t_launch:.1f}s")
-                                                if solved:
-                                                    yield {"type": "challenge_solved"}
-                                                else:
-                                                    # The shown screenshot is stale now; close the modal until a fresh one is captured
-                                                    yield {"type": "challenge_retry", "message": "Verification still pending. Loading a fresh check..."}
-                                        except asyncio.TimeoutError:
-                                            yield {"type": "error", "message": "Verification timed out. Please try again."}
-                                            return
-                                except Exception as exc:
-                                    print(f"[TURNSTILE] Capture/click exception: {exc}")
-                                    # Never leave the user staring at a stale checkbox; the loop re-captures if needed
-                                    yield {"type": "challenge_retry", "message": "Checking verification..."}
+                                    print(f"[TURNSTILE] {clean_id}: user clicked at {t_clicked - t_launch:.1f}s -> {'solved' if solved else 'still pending'} at {time.monotonic() - t_launch:.1f}s")
+                                    if solved:
+                                        yield {"type": "challenge_solved"}
+                                    else:
+                                        # Close the modal; the next round streams a fresh live view
+                                        yield {"type": "challenge_retry", "message": "Verification still pending. Loading a fresh check..."}
 
                         # If on standalone Turnstile step and solved, click continue
                         continue_btn = page.locator('#kc-turnstile-submit, input[type="submit"][name="continue"]').first

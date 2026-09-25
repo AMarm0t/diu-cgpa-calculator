@@ -406,7 +406,7 @@ export default function Home() {
             </div>
             <h3 className={`text-lg font-bold mb-1 ${isDark ? "text-white font-mono" : "text-slate-800"}`}>Quick Security Check</h3>
             <p className={`text-xs mb-5 ${isDark ? "text-[#888888] font-mono" : "text-slate-500"}`}>
-              Please click the verification box below to verify your request
+              When the checkbox appears below, click it
             </p>
             
             <div 
@@ -435,7 +435,7 @@ export default function Home() {
             </div>
 
             <p className={`text-[11px] mt-4 ${isDark ? "text-[#666666] font-mono" : "text-slate-400"}`}>
-              Click anywhere inside the verification box to proceed
+              This is a live view. It may say "Verifying..." for a few seconds first.
             </p>
           </div>
         </div>
