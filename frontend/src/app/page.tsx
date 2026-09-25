@@ -247,7 +247,7 @@ export default function Home() {
     }
 
     try {
-      await fetch(`${API_BASE}/api/captcha-click`, {
+      const res = await fetch(`${API_BASE}/api/captcha-click`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -256,6 +256,11 @@ export default function Home() {
           y: clickY
         })
       });
+      if (!res.ok) throw new Error(`click not accepted (${res.status})`);
+      // Close the popup right away; the progress panel shows the rest. If Cloudflare wants
+      // another click, the backend sends challenge_retry and a fresh checkbox reopens it.
+      setChallengeData(null);
+      setLoadingMsg("Checking your verification...");
     } catch (err) {
       console.error("Failed to forward captcha click:", err);
       if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
@@ -323,15 +328,15 @@ export default function Home() {
               }
               setLoadingMsg(payload.message);
             } else if (payload.type === "challenge_required") {
-              setChallengeData({
-                sessionId: payload.session_id,
-                image: payload.image,
-                box: payload.box || { x: 0, y: 0, width: 300, height: 65 }
-              });
-              // A live-view frame that was already on its way when the user clicked must not
-              // cancel the "Solving challenge..." state; only a retry/solved event ends it.
+              // After a click the popup stays closed; a frame that was already on its way must not
+              // reopen it. Only a challenge_retry (Cloudflare wants another click) re-arms it.
               if (!clickedRef.current) {
                 if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+                setChallengeData({
+                  sessionId: payload.session_id,
+                  image: payload.image,
+                  box: payload.box || { x: 0, y: 0, width: 300, height: 65 }
+                });
                 setIsClicking(false);
               }
             } else if (payload.type === "challenge_retry") {
@@ -419,7 +424,7 @@ export default function Home() {
             </div>
             <h3 className={`text-lg font-bold mb-1 ${isDark ? "text-white font-mono" : "text-slate-800"}`}>Quick Security Check</h3>
             <p className={`text-xs mb-5 ${isDark ? "text-[#888888] font-mono" : "text-slate-500"}`}>
-              When the checkbox appears below, click it
+              Click the checkbox below to continue
             </p>
             
             <div 
@@ -448,7 +453,7 @@ export default function Home() {
             </div>
 
             <p className={`text-[11px] mt-4 ${isDark ? "text-[#666666] font-mono" : "text-slate-400"}`}>
-              This is a live view. It may say "Verifying..." for a few seconds first.
+              Cloudflare needs one click to confirm you're human
             </p>
           </div>
         </div>

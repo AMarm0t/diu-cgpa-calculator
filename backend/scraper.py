@@ -280,10 +280,11 @@ class DIUHeadlessScraper:
 
                         # If Turnstile is active and not yet solved:
                         if has_turnstile and not token_val:
-                            # Live view: stream the widget to the user whenever it changes, until they click
-                            # or Turnstile passes by itself. No "is it the checkbox yet?" guessing: on the
-                            # Linux server the browser's painting stalls at random for ~15s, which broke every
-                            # settle-detection approach; a live view just lags a moment instead.
+                            # Watch the widget frame by frame. While it shows the "Verifying..." spinner the
+                            # user just sees a status line (Cloudflare often passes on its own); once the
+                            # checkbox is on screen, frames are streamed to the popup until they click.
+                            # Each frame is classified by pixels rather than waiting for the widget to
+                            # "settle": on the Linux server painting stalls at random for ~15s.
                             session_event.clear()
                             active_browser_sessions[session_id]["click_coords"] = None
                             last_hash = None
@@ -293,6 +294,7 @@ class DIUHeadlessScraper:
                             last_change_at = time.monotonic()
                             nudged = False
                             reloads = 0
+                            verifying_announced = False
                             while True:
                                 now = time.monotonic()
                                 # Until something is shown the security-check deadline applies; once the user
@@ -344,16 +346,23 @@ class DIUHeadlessScraper:
                                             was_spinner, showing_spinner = showing_spinner, looks_like_spinner(img)
                                             if was_spinner and not showing_spinner:
                                                 print(f"[TURNSTILE] {clean_id}: checkbox visible ({time.monotonic() - t_launch:.1f}s)")
-                                            active_browser_sessions[session_id]["box"] = box
-                                            if shown_at is None:
-                                                shown_at = time.monotonic()
-                                                print(f"[TURNSTILE] {clean_id}: live view started ({shown_at - t_launch:.1f}s)")
-                                            yield {
-                                                "type": "challenge_required",
-                                                "session_id": session_id,
-                                                "image": "data:image/png;base64," + base64.b64encode(img).decode("utf-8"),
-                                                "box": box,
-                                            }
+                                            if showing_spinner:
+                                                # Only the checkbox needs the user; Cloudflare often passes on its own
+                                                # after "Verifying...", in which case no popup is ever shown.
+                                                if not verifying_announced:
+                                                    verifying_announced = True
+                                                    yield {"type": "status", "step": "verify", "message": "Cloudflare is verifying the connection..."}
+                                            else:
+                                                active_browser_sessions[session_id]["box"] = box
+                                                if shown_at is None:
+                                                    shown_at = time.monotonic()
+                                                    print(f"[TURNSTILE] {clean_id}: checkbox shown to user ({shown_at - t_launch:.1f}s)")
+                                                yield {
+                                                    "type": "challenge_required",
+                                                    "session_id": session_id,
+                                                    "image": "data:image/png;base64," + base64.b64encode(img).decode("utf-8"),
+                                                    "box": box,
+                                                }
                                 except Exception as exc:
                                     if TURNSTILE_DEBUG_DIR:
                                         print(f"[TSDEBUG] {clean_id}: {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
