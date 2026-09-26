@@ -107,8 +107,7 @@ ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get(
         "ALLOWED_ORIGINS",
         "http://localhost:3000,https://www.resultscraper.app,https://resultscraper.app,"
-        "https://diu-cgpa-calculator-rho.vercel.app,https://diu-cgpa-calculator-amarm0ts-projects.vercel.app,"
-        "https://diu-cgpa-calculator-three.vercel.app",
+        "https://diu-cgpa-calculator-rho.vercel.app,https://diu-cgpa-calculator-amarm0ts-projects.vercel.app",
     ).split(",") if o.strip()
 ]
 
