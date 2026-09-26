@@ -58,6 +58,11 @@ STALL_SECONDS = 40
 # means the page froze (seen a few times, always right after the click), so retry sooner than STALL_SECONDS
 POST_CLICK_STALL_SECONDS = 20
 
+# Limits for the relayed click's input steps, ~3x their measured normal times (move 1.5-1.8s,
+# press+release 0.2-0.5s over 11 clicks on both servers)
+CLICK_MOVE_TIMEOUT = 6
+CLICK_PRESS_TIMEOUT = 4
+
 
 # Live view stuck on the "Verifying..." spinner: nudge a repaint, then reload the page for a fresh check
 SPINNER_NUDGE_AFTER = 12
@@ -574,23 +579,29 @@ class DIUHeadlessScraper:
                                     try:
                                         click_x = float(coords["x"])
                                         click_y = float(coords["y"])
-                                        # Step labels tell the watchdog (POST_CLICK_STALL_SECONDS) where a hang
-                                        # happened; the durations show what normal looks like before any
-                                        # per-step limit is set (a 6s guess cut off normal slow moves).
+                                        # Now and then the browser never finishes one of these input steps (seen
+                                        # on both servers, always during the move). Each step has a limit ~3x
+                                        # its measured normal time, so a hang is retried on a fresh browser
+                                        # within seconds; the step label and timings go to the log.
                                         t_input = time.monotonic()
                                         task["doing"] = "moving the mouse to the captcha"
                                         # One move: Camoufox's humanize already draws a human-like curved path
                                         # for it. steps=10 made that 10 separate slow animations (~8s, measured)
                                         # while Cloudflare then accepts the click in ~1s.
-                                        await page.mouse.move(click_x, click_y)
+                                        await asyncio.wait_for(page.mouse.move(click_x, click_y), CLICK_MOVE_TIMEOUT)
                                         t_moved = time.monotonic()
                                         task["doing"] = "pressing the captcha checkbox"
-                                        await page.mouse.down()
+                                        await asyncio.wait_for(page.mouse.down(), CLICK_PRESS_TIMEOUT)
                                         await asyncio.sleep(0.1)
                                         task["doing"] = "releasing the captcha checkbox"
-                                        await page.mouse.up()
+                                        await asyncio.wait_for(page.mouse.up(), CLICK_PRESS_TIMEOUT)
                                         t_up = time.monotonic()
                                         print(f"[TURNSTILE] {clean_id}: click delivered - move {t_moved - t_input:.1f}s, press+release {t_up - t_moved:.1f}s")
+                                    except asyncio.TimeoutError:
+                                        print(f"[TURNSTILE] {clean_id}: browser stopped responding while {task['doing']} - retrying")
+                                        yield {"type": "error", "code": "stalled", "detail": task["doing"],
+                                               "message": "DIU's login page stopped responding. Please try again."}
+                                        return
                                     except Exception as exc:
                                         print(f"[TURNSTILE] {clean_id}: click failed: {exc!r}")
 
