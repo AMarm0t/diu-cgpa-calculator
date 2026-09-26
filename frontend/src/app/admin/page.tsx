@@ -236,30 +236,45 @@ export default function AdminPage() {
     setIsLoadingAuth(true);
     setAuthError("");
     try {
-      const res = await fetch(`${API_BASE}/api/admin/me`, {
-        headers: { Authorization: `Bearer ${authToken}` }
-      });
+      let res: Response;
+      try {
+        res = await fetch(`${API_BASE}/api/admin/me`, {
+          headers: { Authorization: `Bearer ${authToken}` }
+        });
+      } catch {
+        // Network hiccup, not a rejection: keep any sign-in we already have; the next session
+        // refresh (every 5 minutes) tries again. Only the sign-in card shows this message.
+        setAuthError("Could not reach the server. Please try again.");
+        return;
+      }
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || "Access denied. Not an authorized admin account.");
+        setAuthError(errData.detail || "Access denied. Not an authorized admin account.");
+        setAdmin(null);
+        setToken("");
+        return;
       }
       const data = await res.json();
       setToken(authToken);
       setAdmin(data.admin);
-    } catch (err: any) {
-      setAuthError(err.message || "Authentication failed.");
-      setAdmin(null);
-      setToken("");
     } finally {
       setIsLoadingAuth(false);
     }
   }, []);
 
-  // When NextAuth session loads with an access token, verify it with backend
+  // When the NextAuth session loads, or brings a renewed Google token (they expire hourly and the
+  // session renews them in the background), verify it with the backend and use it from then on.
   useEffect(() => {
     if (status === "authenticated" && session) {
+      if ((session as any).error) {
+        // Google could not renew the sign-in (revoked, or an old session without a refresh token)
+        setAuthError("Your admin sign-in has expired. Please sign in again.");
+        setAdmin(null);
+        setToken("");
+        return;
+      }
       const authToken = (session as any).idToken || (session as any).accessToken; // ID token carries our client ID as audience
-      if (authToken && !token) {
+      if (authToken && authToken !== token) {
         verifyAndSetToken(authToken);
       }
     }
