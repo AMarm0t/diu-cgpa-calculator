@@ -18,6 +18,7 @@ Every login gets its own browser on a brand-new temporary profile, deleted after
 """
 import asyncio
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -67,6 +68,11 @@ SPARE_WAIT_TIMEOUT = 60
 
 # Seconds to wait for a browser to close before killing it.
 CLOSE_TIMEOUT = 15
+
+# New browsers make one mouse move before use (see _mouse_works): its limit (normal ~1.1-1.5s) and how
+# many browsers to try before giving up on the check.
+MOUSE_CHECK_TIMEOUT = 5
+MOUSE_CHECK_ATTEMPTS = 3
 
 # Throwaway profile dirs live here; leftovers from a crash are wiped at startup.
 PROFILE_ROOT = os.path.abspath(os.getenv("BROWSER_PROFILE_ROOT", "./browser_profiles/tmp"))
@@ -187,6 +193,35 @@ class BrowserPool:
             return self._playwright
 
     async def _prepare(self) -> _Warm:
+        """A new browser whose mouse input works (see _mouse_works); replaces ones where it doesn't."""
+        for attempt in range(1, MOUSE_CHECK_ATTEMPTS + 1):
+            warm = await self._launch()
+            if await self._mouse_works(warm.page) or attempt == MOUSE_CHECK_ATTEMPTS:
+                return warm
+            print(f"[BROWSER] Mouse input hung on a new browser - replacing it ({attempt}/{MOUSE_CHECK_ATTEMPTS})")
+            await self._close(warm)
+
+    @staticmethod
+    async def _mouse_works(page: Page) -> bool:
+        """
+        Makes the browser's first mouse move now, before anyone needs the mouse.
+
+        Camoufox's humanized cursor sends each move as many tiny steps and waits for the page to confirm
+        each one. A step that lands on the pixel the pointer is already on is never confirmed, and from
+        then on every mouse action on that page waits forever (the page itself keeps working). It hits
+        roughly 1 in 10 new browsers, always on their first move out of the corner the pointer starts
+        in; later moves were never affected. Found by reproducing it on the servers without any clicks.
+        """
+        try:
+            await asyncio.wait_for(page.mouse.move(random.randint(200, 600), random.randint(150, 400)),
+                                   MOUSE_CHECK_TIMEOUT)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        except Exception:
+            return True  # any other error: not this problem; don't hold up the login
+
+    async def _launch(self) -> _Warm:
         """Launches a browser on a fresh temp profile and opens its blank page (the slow parts of a login)."""
         playwright = await self._get_playwright()
         async with self._launch_limit:
