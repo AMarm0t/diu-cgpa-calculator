@@ -579,7 +579,10 @@ class DIUHeadlessScraper:
                                         # per-step limit is set (a 6s guess cut off normal slow moves).
                                         t_input = time.monotonic()
                                         task["doing"] = "moving the mouse to the captcha"
-                                        await page.mouse.move(click_x, click_y, steps=10)
+                                        # One move: Camoufox's humanize already draws a human-like curved path
+                                        # for it. steps=10 made that 10 separate slow animations (~8s, measured)
+                                        # while Cloudflare then accepts the click in ~1s.
+                                        await page.mouse.move(click_x, click_y)
                                         t_moved = time.monotonic()
                                         task["doing"] = "pressing the captcha checkbox"
                                         await page.mouse.down()
