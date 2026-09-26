@@ -54,6 +54,10 @@ HEARTBEAT_SECONDS = 3
 # considered frozen and the login is aborted (see DIUHeadlessScraper._watched)
 STALL_SECONDS = 40
 
+# After the user's click Cloudflare accepts it within ~10s (max seen 10.1s); this long without progress
+# means the page froze (seen a few times, always right after the click), so retry sooner than STALL_SECONDS
+POST_CLICK_STALL_SECONDS = 20
+
 # Live view stuck on the "Verifying..." spinner: nudge a repaint, then reload the page for a fresh check
 SPINNER_NUDGE_AFTER = 12
 SPINNER_RELOAD_AFTER = 25
@@ -152,7 +156,8 @@ class DIUHeadlessScraper:
                     task["semesters"] += 1
                 elif etype == "error":
                     task["result"] = event.get("code") or "failed"
-                    task["message"] = str(event.get("message", ""))[:200]
+                    detail = f" (while {event['detail']})" if event.get("detail") else ""
+                    task["message"] = (str(event.get("message", "")) + detail)[:200]
                 elif etype == "complete":
                     task["result"] = "cached" if task["source"] == "cache" else "success"
                     task["stage"] = "done"
@@ -192,8 +197,9 @@ class DIUHeadlessScraper:
                 if not done:
                     deadline = task.get("stall_deadline")
                     if deadline is not None and time.monotonic() > deadline:
-                        print(f"[WATCHDOG] {task['student_id']}: browser stopped responding (stage {task['stage']}) - aborting")
-                        yield {"type": "error", "code": "stalled",
+                        doing = task.get("doing") or task["stage"]
+                        print(f"[WATCHDOG] {task['student_id']}: browser stopped responding while {doing} - aborting")
+                        yield {"type": "error", "code": "stalled", "detail": doing,
                                "message": "DIU's login page stopped responding. Please try again."}
                         return  # the finally cancels the login; its cleanup runs on in that task
                     yield {"type": "heartbeat"}
@@ -336,15 +342,20 @@ class DIUHeadlessScraper:
             active_browser_sessions.pop(session_id, None)
             raise
 
-        def alive(seconds: float = STALL_SECONDS):
-            """Marks the browser phase healthy; the watchdog aborts if the next mark comes later than this."""
+        def alive(seconds: float = STALL_SECONDS, doing: str | None = None):
+            """
+            Marks the browser phase healthy; the watchdog aborts if the next mark comes later than this.
+            `doing` names the step, so a freeze is logged with where it happened.
+            """
             task["stall_deadline"] = time.monotonic() + seconds
+            if doing:
+                task["doing"] = doing
 
         try:
             # Step 1: Login in a dedicated pre-warmed Camoufox browser
             t_launch = time.monotonic()
             hard_deadline = t_launch + MAX_BROWSER_PHASE_SECONDS
-            alive(SPARE_WAIT_TIMEOUT + 60)  # may wait for a browser, then launch one
+            alive(SPARE_WAIT_TIMEOUT + 60, "starting the browser")  # may wait for one, then launch one
             if not browser_pool.has_ready_browser():
                 msg = ("Starting a secure browser for you (~10s)..." if WARM_BROWSERS == 0
                        else "Busy moment - starting a secure browser for you (~10s)...")
@@ -377,7 +388,7 @@ class DIUHeadlessScraper:
                 page.on("framenavigated", lambda frame: check_url(frame.url))
 
                 try:
-                    alive(130)  # the page load below is bounded by its own timeouts
+                    alive(130, "loading the DIU login page")  # bounded by its own timeouts
                     yield {"type": "status", "step": "verify", "message": "Passing security verification..."}
                     # Fast commit navigation prevents dropping connections on slow external assets
                     try:
@@ -401,7 +412,7 @@ class DIUHeadlessScraper:
 
                     # Loop through challenge and login steps
                     for attempt in range(45):
-                        alive()
+                        alive(doing="signing in")
                         check_url(page.url)
                         if auth_code:
                             break
@@ -453,7 +464,7 @@ class DIUHeadlessScraper:
                             reloads = 0
                             verifying_announced = False
                             while True:
-                                alive()
+                                alive(doing="showing the captcha")
                                 now = time.monotonic()
                                 # Until something is shown the security-check deadline applies; once the user
                                 # can see the widget they get CLICK_TIMEOUT to act.
@@ -489,7 +500,7 @@ class DIUHeadlessScraper:
                                                 reloads += 1
                                                 print(f"[TURNSTILE] {clean_id}: spinner stuck {stuck_for:.0f}s - reloading the login page ({reloads}/{MAX_WIDGET_RELOADS})")
                                                 yield {"type": "status", "step": "verify", "message": "Security check got stuck - refreshing it..."}
-                                                alive(90)  # reload + selector wait are bounded themselves
+                                                alive(90, "reloading the stuck captcha")  # bounded themselves
                                                 await page.reload(wait_until="commit", timeout=45000)
                                                 await page.wait_for_selector('input#username, #kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]', timeout=30000)
                                                 widget = page.locator('#kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]').first
@@ -558,6 +569,7 @@ class DIUHeadlessScraper:
                                 phase_deadline += t_clicked - shown_at  # the user's thinking time doesn't count
                                 coords = active_browser_sessions[session_id].get("click_coords")
                                 if coords:
+                                    alive(POST_CLICK_STALL_SECONDS, "clicking the captcha")
                                     try:
                                         click_x = float(coords["x"])
                                         click_y = float(coords["y"])
@@ -576,13 +588,14 @@ class DIUHeadlessScraper:
                                     url_before_click = page.url
                                     solved = False
                                     for _ in range(30):
-                                        alive()
+                                        alive(POST_CLICK_STALL_SECONDS, "waiting for Cloudflare after the click")
                                         await page.wait_for_timeout(300)
                                         check_url(page.url)
                                         if auth_code or page.url != url_before_click:
                                             solved = True
                                             break
                                         try:
+                                            task["doing"] = "reading the page after the click"
                                             token_val = await page.evaluate(TOKEN_JS)
                                             widget_gone = await page.locator('#kc-turnstile-widget, .cf-turnstile, iframe[src*="challenges.cloudflare.com"]').count() == 0
                                         except Exception:
