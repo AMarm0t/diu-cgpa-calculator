@@ -71,14 +71,15 @@ const API_BASE = API_BASES[0];
 const STREAM_IDLE_LIMIT_MS = 45000;
 
 // Picks which server should handle a new login. Prefers a server with a free slot (a login can
-// start at once), choosing a warm one and the primary on ties; otherwise the shortest queue.
+// start at once), choosing a warm one, then the lowest server-set priority, then the first listed;
+// otherwise the shortest queue.
 // A server that doesn't answer its capacity check within 2.5s is treated as down and skipped; once
 // any server has reported a free slot the others get only 300ms more, so a hung server doesn't
 // delay logins on a healthy one.
 // `avoid` (a server whose browser just froze) is only chosen when it is clearly the better option.
 async function pickServer(avoid?: string): Promise<string> {
   if (API_BASES.length === 1) return API_BASES[0];
-  type Probe = { base: string; index: number; free: number; waiting: number; ready: boolean };
+  type Probe = { base: string; index: number; free: number; waiting: number; ready: boolean; priority: number };
   const answers: (Probe | null)[] = API_BASES.map(() => null);
   let onFree: () => void = () => {};
   const someoneFree = new Promise<void>((resolve) => (onFree = resolve));
@@ -95,6 +96,7 @@ async function pickServer(avoid?: string): Promise<string> {
         free: Number(d.free_slots ?? 0),
         waiting: Number(d.waiting ?? 999),
         ready: Boolean(d.has_ready_browser),
+        priority: Number(d.priority ?? 0), // server-set preference, lower first
       };
       if (answers[index]!.free > 0) onFree();
     } catch {
@@ -112,11 +114,20 @@ async function pickServer(avoid?: string): Promise<string> {
   const free = up.filter((s) => s.free > 0);
   if (free.length > 0) {
     free.sort((a, b) =>
-      Number(a.base === avoid) - Number(b.base === avoid) || Number(b.ready) - Number(a.ready) || a.index - b.index
+      Number(a.base === avoid) - Number(b.base === avoid) ||
+        Number(b.ready) - Number(a.ready) ||
+        a.priority - b.priority ||
+        a.index - b.index
     );
     return free[0].base;
   }
-  up.sort((a, b) => a.waiting - b.waiting || Number(a.base === avoid) - Number(b.base === avoid) || a.index - b.index);
+  up.sort(
+    (a, b) =>
+      a.waiting - b.waiting ||
+      Number(a.base === avoid) - Number(b.base === avoid) ||
+      a.priority - b.priority ||
+      a.index - b.index
+  );
   return up[0].base;
 }
 

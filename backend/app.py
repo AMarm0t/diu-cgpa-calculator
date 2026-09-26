@@ -63,6 +63,8 @@ class ManualCgpaRequest(BaseModel):
 # A short name for this server, shown in the admin panel so each task/queue entry can be traced
 # to the machine that handled it. Set NODE_NAME per server (e.g. azure-1, azure-2).
 NODE_NAME = os.environ.get("NODE_NAME") or socket.gethostname()
+# Which free server the site picks first: lower wins (ties go to the order in the site config)
+NODE_PRIORITY = int(os.environ.get("NODE_PRIORITY", "0"))
 
 # FastAPI app
 # Interactive API docs (/docs, /redoc, /openapi.json) map every endpoint for an attacker;
@@ -186,6 +188,7 @@ async def capacity(http_request: Request):
     limit = q.get("limit", 1)
     return {
         "node": NODE_NAME,
+        "priority": NODE_PRIORITY,
         "limit": limit,
         "active": active,
         "free_slots": max(0, limit - active),
