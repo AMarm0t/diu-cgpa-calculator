@@ -58,6 +58,9 @@ STALL_SECONDS = 40
 # means the page froze (seen a few times, always right after the click), so retry sooner than STALL_SECONDS
 POST_CLICK_STALL_SECONDS = 20
 
+# Limit for each mouse step of the relayed click (move / press / release); normally well under 2s
+CLICK_STEP_TIMEOUT = 6
+
 # Live view stuck on the "Verifying..." spinner: nudge a repaint, then reload the page for a fresh check
 SPINNER_NUDGE_AFTER = 12
 SPINNER_RELOAD_AFTER = 25
@@ -573,10 +576,24 @@ class DIUHeadlessScraper:
                                     try:
                                         click_x = float(coords["x"])
                                         click_y = float(coords["y"])
-                                        await page.mouse.move(click_x, click_y, steps=10)
-                                        await page.mouse.down()
-                                        await page.wait_for_timeout(100)
-                                        await page.mouse.up()
+                                        # Each input step normally finishes in well under a second. Now and
+                                        # then the browser never acknowledges one (seen on both servers), so
+                                        # each gets its own short limit: the site retries on a fresh browser
+                                        # within seconds instead of waiting for the watchdog.
+                                        t_input = time.monotonic()
+                                        task["doing"] = "moving the mouse to the captcha"
+                                        await asyncio.wait_for(page.mouse.move(click_x, click_y, steps=10), CLICK_STEP_TIMEOUT)
+                                        task["doing"] = "pressing the captcha checkbox"
+                                        await asyncio.wait_for(page.mouse.down(), CLICK_STEP_TIMEOUT)
+                                        await asyncio.sleep(0.1)
+                                        task["doing"] = "releasing the captcha checkbox"
+                                        await asyncio.wait_for(page.mouse.up(), CLICK_STEP_TIMEOUT)
+                                        print(f"[TURNSTILE] {clean_id}: click delivered in {time.monotonic() - t_input:.1f}s")
+                                    except asyncio.TimeoutError:
+                                        print(f"[TURNSTILE] {clean_id}: browser stopped responding while {task['doing']} - retrying")
+                                        yield {"type": "error", "code": "stalled", "detail": task["doing"],
+                                               "message": "DIU's login page stopped responding. Please try again."}
+                                        return
                                     except Exception as exc:
                                         print(f"[TURNSTILE] {clean_id}: click failed: {exc!r}")
 
