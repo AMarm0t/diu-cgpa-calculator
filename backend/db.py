@@ -28,6 +28,11 @@ if not PASSWORD_PEPPER:
 # passwords impractical, cheap enough for a cache check.
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 14, 8, 1
 
+# Rows of student_results that hold app data instead of a student (never listed or reset)
+SYSTEM_SETTINGS_ID = "__SYSTEM_SETTINGS__"
+ADMIN_AUTH_ID = "__ADMIN_AUTH__"
+SYSTEM_ROW_IDS = (SYSTEM_SETTINGS_ID, ADMIN_AUTH_ID)
+
 SQLITE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "results_cache.db"))
 
 supabase_client = None
@@ -207,7 +212,7 @@ def list_all_students() -> List[Dict[str, Any]]:
         try:
             res = client.table("student_results").select(
                 "student_id, student_name, department, campus, overall_cgpa, total_credits, completed_credits, last_fetched_at"
-            ).neq("student_id", "__SYSTEM_SETTINGS__").order("last_fetched_at", desc=True).execute()
+            ).not_.in_("student_id", list(SYSTEM_ROW_IDS)).order("last_fetched_at", desc=True).execute()
             return res.data or []
         except Exception as e:
             print(f"[DB] Supabase error in list_all_students: {e}")
@@ -221,9 +226,9 @@ def list_all_students() -> List[Dict[str, Any]]:
         cursor.execute("""
             SELECT student_id, student_name, department, campus, overall_cgpa, total_credits, completed_credits, last_fetched_at 
             FROM student_results 
-            WHERE student_id != '__SYSTEM_SETTINGS__'
+            WHERE student_id NOT IN (?, ?)
             ORDER BY last_fetched_at DESC
-        """)
+        """, SYSTEM_ROW_IDS)
         return [dict(r) for r in cursor.fetchall()]
 
 def get_system_settings() -> Dict[str, Any]:
@@ -272,6 +277,49 @@ def reset_student_cache(student_id: str) -> bool:
         cursor.execute("UPDATE student_results SET last_fetched_at = ? WHERE student_id = ?", (epoch_iso, clean_id))
         conn.commit()
         return cursor.rowcount > 0
+
+def reset_all_student_caches() -> int:
+    """Expires every student's cached result (not the app's own rows); returns how many."""
+    epoch_iso = "1970-01-01T00:00:00Z"
+    client = get_supabase()
+    if client:
+        try:
+            res = client.table("student_results").update({"last_fetched_at": epoch_iso}).not_.in_(
+                "student_id", list(SYSTEM_ROW_IDS)
+            ).execute()
+            return len(res.data or [])
+        except Exception as e:
+            print(f"[DB] Supabase error in reset_all_student_caches: {e}")
+
+    if not os.path.exists(SQLITE_PATH):
+        init_db()
+
+    with sqlite3.connect(SQLITE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE student_results SET last_fetched_at = ? WHERE student_id NOT IN (?, ?)",
+            (epoch_iso, *SYSTEM_ROW_IDS),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+def get_admin_auth() -> Dict[str, Any]:
+    """Admin password hashes, sign-in counters and session fingerprints (see admin_auth.py)."""
+    row = get_student(ADMIN_AUTH_ID)
+    data = row.get("results_json") if row else None
+    return data if isinstance(data, dict) else {}
+
+def save_admin_auth(data: Dict[str, Any]) -> bool:
+    return upsert_student(
+        student_id=ADMIN_AUTH_ID,
+        password=os.urandom(16).hex(),  # the row's own password column is never used
+        student_info={"name": "Admin Sign-in"},
+        overall_cgpa=0.0,
+        total_credits=0.0,
+        completed_credits=0.0,
+        semesters=[],
+        custom_payload=data,
+    )
 
 def delete_student(student_id: str) -> bool:
     """Deletes a student record and removes their browser profile directory."""

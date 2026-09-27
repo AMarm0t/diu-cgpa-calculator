@@ -30,7 +30,8 @@ import {
   RefreshCw,
   UserX,
   AlertTriangle,
-  Activity
+  Activity,
+  KeyRound
 } from "lucide-react";
 
 // Backend servers (comma-separated in NEXT_PUBLIC_API_URLS). The first is primary; the admin
@@ -50,6 +51,26 @@ interface AdminProfile {
   name: string;
   email: string;
   picture?: string;
+  method?: "google" | "password";
+  expires_at?: number;
+}
+
+// Email + password sign-in: the backend's session token lives only in this tab (sessionStorage)
+const PASSWORD_SESSION_KEY = "rs_admin_session";
+
+function readPasswordSession(): { token: string; expires_at: number } | null {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(PASSWORD_SESSION_KEY) || "null");
+    if (saved?.token && saved.expires_at * 1000 > Date.now()) return saved;
+    sessionStorage.removeItem(PASSWORD_SESSION_KEY);
+  } catch {}
+  return null;
+}
+
+function clearPasswordSession() {
+  try {
+    sessionStorage.removeItem(PASSWORD_SESSION_KEY);
+  } catch {}
 }
 
 interface StudentSummary {
@@ -175,6 +196,16 @@ export default function AdminPage() {
   const [authError, setAuthError] = useState<string>("");
   const [isLoadingAuth, setIsLoadingAuth] = useState<boolean>(false);
 
+  // Email + password sign-in
+  const [loginEmail, setLoginEmail] = useState<string>("");
+  const [loginPassword, setLoginPassword] = useState<string>("");
+  const [isPasswordSigningIn, setIsPasswordSigningIn] = useState<boolean>(false);
+  const [passwordStatus, setPasswordStatus] = useState<{ has_password: boolean; updated_at?: string | null } | null>(null);
+  const [newPassword, setNewPassword] = useState<string>("");
+  const [confirmPassword, setConfirmPassword] = useState<string>("");
+  const [isSavingPassword, setIsSavingPassword] = useState<boolean>(false);
+  const [isResettingAll, setIsResettingAll] = useState<boolean>(false);
+
   const [students, setStudents] = useState<StudentSummary[]>([]);
   const [isLoadingStudents, setIsLoadingStudents] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -249,7 +280,12 @@ export default function AdminPage() {
       }
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        setAuthError(errData.detail || "Access denied. Not an authorized admin account.");
+        if (authToken.startsWith("rsadm_")) {
+          clearPasswordSession();
+          setAuthError("Your admin session has ended. Please sign in again.");
+        } else {
+          setAuthError(errData.detail || "Access denied. Not an authorized admin account.");
+        }
         setAdmin(null);
         setToken("");
         return;
@@ -279,6 +315,55 @@ export default function AdminPage() {
       }
     }
   }, [session, status, token, verifyAndSetToken]);
+
+  // A password session survives reloads of this tab until it expires
+  useEffect(() => {
+    const saved = readPasswordSession();
+    if (saved) verifyAndSetToken(saved.token);
+  }, [verifyAndSetToken]);
+
+  // End a password session in the page when the server's 12-hour limit is reached
+  useEffect(() => {
+    if (admin?.method !== "password" || !admin.expires_at) return;
+    const timer = setTimeout(() => {
+      clearPasswordSession();
+      setToken("");
+      setAdmin(null);
+      setAuthError("Your admin session has ended. Please sign in again.");
+    }, Math.max(0, admin.expires_at * 1000 - Date.now()));
+    return () => clearTimeout(timer);
+  }, [admin]);
+
+  const handlePasswordSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    setIsPasswordSigningIn(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: loginEmail.trim(), password: loginPassword }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setAuthError(
+          res.status === 401
+            ? "Invalid email or password. After 5 wrong tries, password sign-in pauses for 15 minutes."
+            : typeof data.detail === "string" ? data.detail : "Could not sign in. Please try again."
+        );
+        return;
+      }
+      try {
+        sessionStorage.setItem(PASSWORD_SESSION_KEY, JSON.stringify({ token: data.token, expires_at: data.expires_at }));
+      } catch {}
+      setLoginPassword("");
+      await verifyAndSetToken(data.token);
+    } catch {
+      setAuthError("Could not reach the server. Please try again.");
+    } finally {
+      setIsPasswordSigningIn(false);
+    }
+  };
 
   // Fetch students list
   const fetchStudents = useCallback(async () => {
@@ -314,6 +399,10 @@ export default function AdminPage() {
           setPublicSearchEnabled(data.settings.public_search_enabled ?? true);
         }
       }
+      const pw = await fetch(`${API_BASE}/api/admin/password`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (pw.ok) setPasswordStatus(await pw.json());
     } catch (err) {
       console.error("Failed to load settings:", err);
     } finally {
@@ -683,9 +772,96 @@ export default function AdminPage() {
   };
 
   const handleLogout = async () => {
+    const wasPasswordSession = admin?.method === "password";
+    const oldToken = token;
     setToken("");
     setAdmin(null);
+    setPasswordStatus(null);
+    if (wasPasswordSession) {
+      clearPasswordSession();
+      // Ends the session on the server too, so the token is useless even if it was copied
+      await fetch(`${API_BASE}/api/admin/logout`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${oldToken}` }
+      }).catch(() => {});
+      if (status !== "authenticated") return;
+    }
     await signOut({ callbackUrl: "/admin" });
+  };
+
+  const handleSavePassword = async () => {
+    if (newPassword.length < 12) {
+      showToast("Use at least 12 characters.", "error");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      showToast("The two passwords don't match.", "error");
+      return;
+    }
+    setIsSavingPassword(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ password: newPassword })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setPasswordStatus(data);
+        setNewPassword("");
+        setConfirmPassword("");
+        showToast("Password saved. You can now sign in with your email and password.");
+      } else {
+        showToast(typeof data.detail === "string" ? data.detail : "Could not save the password.", "error");
+      }
+    } catch {
+      showToast("Error connecting to server.", "error");
+    } finally {
+      setIsSavingPassword(false);
+    }
+  };
+
+  const handleRemovePassword = async () => {
+    if (!window.confirm("Remove your admin password? Password sign-in stops working until you set a new one.")) return;
+    setIsSavingPassword(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/password`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setPasswordStatus({ has_password: false });
+        showToast("Password removed. Only Google sign-in works now.");
+      } else {
+        showToast("Could not remove the password.", "error");
+      }
+    } catch {
+      showToast("Error connecting to server.", "error");
+    } finally {
+      setIsSavingPassword(false);
+    }
+  };
+
+  const handleResetAllCaches = async () => {
+    if (!window.confirm("Reset the cache of every student? Each student's next search will fetch fresh results from the DIU portal.")) return;
+    setIsResettingAll(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/reset-all-cache`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        showToast(`Cache reset for all ${data.count ?? 0} students.`);
+        fetchStudents();
+      } else {
+        showToast("Failed to reset the caches.", "error");
+      }
+    } catch {
+      showToast("Error connecting to server.", "error");
+    } finally {
+      setIsResettingAll(false);
+    }
   };
 
   // Inspect student detail
@@ -882,6 +1058,48 @@ export default function AdminPage() {
                     </svg>
                     <span>Sign in with Google</span>
                   </button>
+
+                  <div className="w-full flex items-center gap-3 py-1 text-[10px] uppercase tracking-wider text-[#555555]">
+                    <div className="h-px flex-1 bg-[#262626]" />
+                    <span>or</span>
+                    <div className="h-px flex-1 bg-[#262626]" />
+                  </div>
+
+                  <form onSubmit={handlePasswordSignIn} className="w-full space-y-2.5 text-left">
+                    <label className="block text-[11px] text-[#888888]" htmlFor="admin-email">Email</label>
+                    <input
+                      id="admin-email"
+                      type="email"
+                      autoComplete="username"
+                      required
+                      maxLength={254}
+                      value={loginEmail}
+                      onChange={(e) => setLoginEmail(e.target.value)}
+                      className="w-full bg-[#111111] border border-[#2b2b2b] rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
+                    />
+                    <label className="block text-[11px] text-[#888888]" htmlFor="admin-password">Password</label>
+                    <input
+                      id="admin-password"
+                      type="password"
+                      autoComplete="current-password"
+                      required
+                      maxLength={128}
+                      value={loginPassword}
+                      onChange={(e) => setLoginPassword(e.target.value)}
+                      className="w-full bg-[#111111] border border-[#2b2b2b] rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
+                    />
+                    <button
+                      type="submit"
+                      disabled={isPasswordSigningIn}
+                      className="w-full mt-1 flex items-center justify-center space-x-2 bg-[#3ecf8e] hover:bg-[#34b27b] text-black font-semibold px-4 py-2.5 rounded-lg text-sm transition-all active:scale-[0.99] disabled:opacity-60 cursor-pointer"
+                    >
+                      {isPasswordSigningIn ? <Loader2 className="w-4 h-4 animate-spin" /> : <KeyRound className="w-4 h-4" />}
+                      <span>{isPasswordSigningIn ? "Signing in..." : "Sign in with password"}</span>
+                    </button>
+                    <p className="text-[10px] text-[#666666] leading-relaxed pt-1">
+                      Set a password first: sign in with Google, then open Settings.
+                    </p>
+                  </form>
                 </div>
               )}
             </div>
@@ -1167,7 +1385,9 @@ export default function AdminPage() {
                           <Clock className="w-4 h-4 text-[#3ecf8e]" />
                           <span className="text-xs font-semibold text-white">Cache Expiration Timer</span>
                           <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-[#3ecf8e]/10 text-[#3ecf8e] border border-[#3ecf8e]/20">
-                            {cacheTtlMinutes >= 1440 
+                            {cacheTtlMinutes === 0
+                              ? "Never expires"
+                              : cacheTtlMinutes >= 1440 
                               ? `${(cacheTtlMinutes / 1440).toFixed(1)} Days`
                               : cacheTtlMinutes >= 60 
                               ? `${(cacheTtlMinutes / 60).toFixed(1)} Hours`
@@ -1175,7 +1395,7 @@ export default function AdminPage() {
                           </span>
                         </div>
                         <p className="text-[11px] text-[#777777] mt-1 leading-relaxed">
-                          Once a student's result is cached in Supabase, subsequent searches return instantly without launching a browser. After this timer expires, the next search automatically performs a fresh live scrape from the DIU portal.
+                          Once a student's result is cached in Supabase, subsequent searches return instantly without launching a browser. After this timer expires, the next search automatically performs a fresh live scrape from the DIU portal. With "Never", cached results stay until you reset that student.
                         </p>
                       </div>
 
@@ -1187,6 +1407,7 @@ export default function AdminPage() {
                           { label: "6 Hours", val: 360 },
                           { label: "24 Hours (1 Day)", val: 1440 },
                           { label: "7 Days", val: 10080 },
+                          { label: "Never (until reset)", val: 0 },
                         ].map((preset) => (
                           <button
                             key={preset.val}
@@ -1209,11 +1430,28 @@ export default function AdminPage() {
                         <input
                           type="number"
                           min={1}
-                          max={525600}
-                          value={cacheTtlMinutes}
-                          onChange={(e) => setCacheTtlMinutes(Math.max(1, parseInt(e.target.value) || 1))}
+                          max={10080}
+                          value={cacheTtlMinutes || ""}
+                          placeholder="never"
+                          onChange={(e) => setCacheTtlMinutes(Math.min(10080, Math.max(1, parseInt(e.target.value) || 1)))}
                           className="w-28 bg-[#111111] border border-[#2b2b2b] rounded px-3 py-1 text-xs text-white font-mono focus:outline-none focus:border-[#3ecf8e]"
                         />
+                      </div>
+
+                      {/* Reset every student's cache */}
+                      <div className="pt-3 mt-1 border-t border-[#232323] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <p className="text-[11px] text-[#777777] leading-relaxed">
+                          Expire every student's cached result now. Each student's next search fetches fresh results.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={handleResetAllCaches}
+                          disabled={isResettingAll}
+                          className="flex-shrink-0 px-3 py-1.5 rounded text-xs font-mono border border-amber-500/40 text-amber-300 bg-amber-950/30 hover:bg-amber-950/60 transition-colors flex items-center gap-2 disabled:opacity-60 cursor-pointer"
+                        >
+                          {isResettingAll ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                          <span>{isResettingAll ? "Resetting..." : "Reset all caches"}</span>
+                        </button>
                       </div>
                     </div>
 
@@ -1234,6 +1472,82 @@ export default function AdminPage() {
                       </button>
                     </div>
                   </div>
+                </div>
+
+                {/* Admin password (email + password sign-in) */}
+                <div className="bg-[#161616] border border-[#242424] rounded-xl p-6 space-y-4">
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <KeyRound className="w-4 h-4 text-[#3ecf8e]" />
+                      Admin Password
+                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                        passwordStatus?.has_password
+                          ? "bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/20"
+                          : "bg-[#1f1f1f] text-[#888888] border-[#333333]"
+                      }`}>
+                        {passwordStatus?.has_password ? "SET" : "NOT SET"}
+                      </span>
+                    </h3>
+                    <p className="text-xs text-[#777777] mt-1 leading-relaxed">
+                      Lets you sign in as <span className="font-mono text-[#aaaaaa]">{admin?.email}</span> with a password instead of Google.
+                      Use at least 12 characters, and a password you don't use anywhere else.
+                      {passwordStatus?.has_password && passwordStatus.updated_at
+                        ? ` Last set ${new Date(passwordStatus.updated_at).toLocaleString()}.`
+                        : ""}
+                    </p>
+                  </div>
+
+                  {admin?.method === "google" ? (
+                    <div className="space-y-3">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          aria-label="New password"
+                          maxLength={128}
+                          value={newPassword}
+                          onChange={(e) => setNewPassword(e.target.value)}
+                          placeholder={passwordStatus?.has_password ? "New password" : "Password"}
+                          className="w-full bg-[#111111] border border-[#2b2b2b] rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
+                        />
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          aria-label="Repeat the password"
+                          maxLength={128}
+                          value={confirmPassword}
+                          onChange={(e) => setConfirmPassword(e.target.value)}
+                          placeholder="Repeat password"
+                          className="w-full bg-[#111111] border border-[#2b2b2b] rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-[#3ecf8e]"
+                        />
+                      </div>
+                      <div className="flex flex-wrap justify-end gap-2">
+                        {passwordStatus?.has_password && (
+                          <button
+                            type="button"
+                            onClick={handleRemovePassword}
+                            disabled={isSavingPassword}
+                            className="px-3 py-2 rounded-lg text-xs border border-red-500/40 text-red-300 bg-red-950/30 hover:bg-red-950/60 transition-colors disabled:opacity-60 cursor-pointer"
+                          >
+                            Remove password
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={handleSavePassword}
+                          disabled={isSavingPassword || !newPassword}
+                          className="px-4 py-2 bg-[#3ecf8e] hover:bg-[#34b27b] text-black font-semibold rounded-lg text-xs flex items-center space-x-2 transition-all disabled:opacity-60 cursor-pointer"
+                        >
+                          {isSavingPassword ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                          <span>{passwordStatus?.has_password ? "Change password" : "Set password"}</span>
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-amber-300/90 bg-amber-950/20 border border-amber-500/20 rounded-lg p-3">
+                      You're signed in with your password. To change or remove it, sign out and sign in with Google.
+                    </p>
+                  )}
                 </div>
               </div>
             )}

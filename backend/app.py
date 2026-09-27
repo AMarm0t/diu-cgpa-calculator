@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import db
+import admin_auth
 from auth import verify_google_admin
 from queue_manager import queue_manager
 from scraper import DIUHeadlessScraper, dispatch_remote_click, request_leave
@@ -208,7 +209,7 @@ async def scrape_stream_endpoint(request: ScrapeRequest, http_request: Request, 
     if not settings.get("public_search_enabled", True):
         is_admin = False
         if authorization and authorization.startswith("Bearer "):
-            admin_data = await verify_google_admin(authorization.split()[1])
+            admin_data = await admin_from_token(authorization.split()[1])
             if admin_data:
                 is_admin = True
         if not is_admin:
@@ -311,22 +312,92 @@ def valid_student_id(student_id: str) -> str:
     return sid
 
 
-async def get_current_admin(authorization: str = Header(None)):
+async def admin_from_token(token: str) -> Optional[dict]:
+    """The admin behind a bearer token: an admin password session or a Google sign-in."""
+    if token.startswith(admin_auth.TOKEN_PREFIX):
+        return await asyncio.to_thread(admin_auth.session_admin, token)
+    admin = await verify_google_admin(token)
+    return {**admin, "method": "google"} if admin else None
+
+
+def _bearer(authorization: Optional[str]) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Authentication required")
     parts = authorization.split()
     if len(parts) != 2 or parts[0].lower() != "bearer":
         raise HTTPException(status_code=401, detail="Invalid authorization header format")
-    token = parts[1]
-    admin = await verify_google_admin(token)
+    return parts[1]
+
+
+async def get_current_admin(authorization: str = Header(None)):
+    admin = await admin_from_token(_bearer(authorization))
     if not admin:
-        raise HTTPException(status_code=403, detail="Access denied. Authorized Google admin account required.")
+        raise HTTPException(status_code=403, detail="Access denied. Authorized admin account required.")
+    return admin
+
+
+async def get_google_admin(admin: dict = Depends(get_current_admin)):
+    """Admin signed in with Google: required to set, change or remove an admin password."""
+    if admin.get("method") != "google":
+        raise HTTPException(status_code=403, detail="Sign in with Google to change the admin password.")
     return admin
 
 @app.get("/api/admin/me")
 async def admin_me(admin: dict = Depends(get_current_admin)):
-    """Verifies that the caller's Google credentials are valid and authorized."""
+    """Verifies that the caller's credentials are valid and authorized."""
     return {"status": "ok", "admin": admin}
+
+
+# --- Admin email + password sign-in (see admin_auth.py for the safeguards) ---
+ADMIN_LOGIN_MIN_SECONDS = 1.0  # every reply takes at least this long: slows guessing, hides timing
+
+
+class AdminLoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=1, max_length=admin_auth.MAX_PASSWORD_LENGTH)
+
+
+class AdminPasswordRequest(BaseModel):
+    password: str = Field(..., min_length=1, max_length=admin_auth.MAX_PASSWORD_LENGTH)
+
+
+@app.post("/api/admin/login")
+async def admin_password_login(req: AdminLoginRequest, http_request: Request):
+    _enforce_limit("admin-login", client_ip(http_request), 10, 60,
+                   "Too many sign-in attempts. Please wait a minute and try again.")
+    started = time.monotonic()
+    session = await asyncio.to_thread(admin_auth.login, req.email, req.password)
+    await asyncio.sleep(max(0.0, ADMIN_LOGIN_MIN_SECONDS - (time.monotonic() - started)))
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    return {"status": "ok", **session}
+
+
+@app.post("/api/admin/logout")
+async def admin_password_logout(authorization: str = Header(None)):
+    await asyncio.to_thread(admin_auth.logout, _bearer(authorization))
+    return {"status": "ok"}
+
+
+@app.get("/api/admin/password")
+async def admin_password_status(admin: dict = Depends(get_current_admin)):
+    info = await asyncio.to_thread(admin_auth.status, admin["email"])
+    return {"status": "ok", **info}
+
+
+@app.post("/api/admin/password")
+async def admin_set_password(req: AdminPasswordRequest, admin: dict = Depends(get_google_admin)):
+    problem = admin_auth.password_problem(req.password, admin["email"])
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    await asyncio.to_thread(admin_auth.set_password, admin["email"], req.password)
+    return {"status": "ok", **(await asyncio.to_thread(admin_auth.status, admin["email"]))}
+
+
+@app.delete("/api/admin/password")
+async def admin_remove_password(admin: dict = Depends(get_google_admin)):
+    await asyncio.to_thread(admin_auth.remove_password, admin["email"])
+    return {"status": "ok", "has_password": False}
 
 @app.get("/api/admin/students")
 async def admin_list_students(admin: dict = Depends(get_current_admin)):
@@ -352,6 +423,13 @@ async def admin_reset_student_cache(student_id: str, admin: dict = Depends(get_c
     success = db.reset_student_cache(student_id)
     return {"status": "ok", "message": f"Cache expired for {student_id}. Next login will scrape portal live."}
 
+@app.post("/api/admin/reset-all-cache")
+async def admin_reset_all_caches(admin: dict = Depends(get_current_admin)):
+    """Expires every student's cached result, so each one's next search fetches fresh results."""
+    count = await asyncio.to_thread(db.reset_all_student_caches)
+    print(f"[ADMIN] {admin['email']} reset the cache of all {count} students")
+    return {"status": "ok", "count": count}
+
 @app.delete("/api/admin/student/{student_id}")
 async def admin_delete_student(student_id: str, admin: dict = Depends(get_current_admin)):
     """Permanently deletes student records and cached browser profile from database."""
@@ -360,7 +438,7 @@ async def admin_delete_student(student_id: str, admin: dict = Depends(get_curren
     return {"status": "ok", "message": f"Student {student_id} permanently removed from database."}
 
 class SettingsUpdateRequest(BaseModel):
-    cache_ttl_minutes: Optional[int] = Field(None, ge=1, le=10080)  # up to one week
+    cache_ttl_minutes: Optional[int] = Field(None, ge=0, le=10080)  # up to one week; 0 = never expire
     public_search_enabled: Optional[bool] = None
 
 @app.get("/api/admin/settings")
@@ -374,7 +452,7 @@ async def admin_update_settings(req: SettingsUpdateRequest, admin: dict = Depend
     """Updates global system settings (cache TTL and public search toggle)."""
     updates = {}
     if req.cache_ttl_minutes is not None:
-        updates["cache_ttl_minutes"] = max(1, req.cache_ttl_minutes)
+        updates["cache_ttl_minutes"] = req.cache_ttl_minutes
     if req.public_search_enabled is not None:
         updates["public_search_enabled"] = req.public_search_enabled
     db.update_system_settings(updates)

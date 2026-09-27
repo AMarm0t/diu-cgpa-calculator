@@ -243,9 +243,11 @@ class DIUHeadlessScraper:
                             dt = dt.replace(tzinfo=timezone.utc)
                         age = (datetime.now(timezone.utc) - dt).total_seconds()
                         settings = await asyncio.to_thread(db.get_system_settings)
-                        ttl_minutes = settings.get("cache_ttl_minutes", 60)
-                        ttl_seconds = max(60, int(ttl_minutes) * 60)
-                        if age < ttl_seconds:
+                        ttl_minutes = int(settings.get("cache_ttl_minutes", 60))
+                        if ttl_minutes <= 0:
+                            # "Never expire": only an admin reset (which dates the entry to 1970) refreshes it
+                            is_fresh = dt.year > 1970
+                        elif age < max(60, ttl_minutes * 60):
                             is_fresh = True
                     except Exception as err:
                         print(f"[CACHE] Timestamp parse error: {err}")
@@ -739,7 +741,7 @@ class DIUHeadlessScraper:
             # Profile + semester catalog + history in parallel instead of 4 sequential round-trips
             account_resp, active_resp, sem_resp, graph_resp = await asyncio.gather(
                 get_or_none(f"{GATEWAY_BASE}/account"),
-                get_or_none(f"{GATEWAY_BASE}/active"),
+                get_or_none(f"{GATEWAY_BASE}/semester/active"),
                 get_or_none(f"{GATEWAY_BASE}/semester"),
                 get_or_none(f"{GATEWAY_BASE}/graph"),
             )
@@ -765,23 +767,44 @@ class DIUHeadlessScraper:
             # Stream student info right now so frontend immediately displays dashboard!
             yield {"type": "student", "data": student_info}
 
-            # Step 4: Semesters Catalog & Active List
+            # Step 4: Semester catalog. /semester/active lists every DIU semester as
+            # {id, name: "Fall 2023", code: "233"}; results are requested by that id.
             active_semesters = {}
+            semester_codes = {}
             if active_resp:
-                for s in active_resp.json().get('data', []):
-                    active_semesters[s.get('id')] = s.get('name', f"Semester {s.get('id')}")
+                try:
+                    catalog = active_resp.json()
+                    for s in (catalog.get('data') if isinstance(catalog, dict) else catalog) or []:
+                        if not isinstance(s, dict) or s.get('id') is None or not s.get('name'):
+                            continue
+                        active_semesters[int(s['id'])] = str(s['name']).strip()
+                        if s.get('code'):
+                            semester_codes[int(s['id'])] = str(s['code']).strip()
+                except Exception as e:
+                    print(f"[SCRAPER] Could not read the semester list: {e}")
 
+            current_semester_id = None
             if sem_resp:
                 d = sem_resp.json().get('data', {})
                 if 'SEMESTER_ID' in d:
-                    active_semesters[int(d['SEMESTER_ID'])] = d.get('SEMESTER_NAME', 'Enrolled Semester')
+                    current_semester_id = int(d['SEMESTER_ID'])
+                    active_semesters.setdefault(current_semester_id, d.get('SEMESTER_NAME', 'Enrolled Semester'))
 
             graph_data = graph_resp.json().get('data', []) if graph_resp else []
 
             # Step 5: Scan every candidate semester concurrently, streaming results in semester order
             semesters_found = []
+            # Batch and program come with every course result (studentInformation), taken from the first one
+            profile = {}
 
-            candidate_ids = sorted(set(active_semesters.keys()) | set(range(60, 90)))
+            # Ids below 60 are semesters from before 2021; the catalog adds ones newer than the fixed range.
+            # Results stream in date order: by DIU code (233 = Fall 2023, 241 = Spring 2024, 244 = Short
+            # 2024), since ids need not follow the calendar; ids the catalog doesn't know go last.
+            candidate_ids = sorted(
+                {sid for sid in active_semesters if sid >= 60} | set(range(60, 90))
+                | ({current_semester_id} if current_semester_id else set()),
+                key=lambda sid: (0, semester_codes[sid], sid) if sid in semester_codes else (1, "", sid),
+            )
             fetch_limit = asyncio.Semaphore(SEMESTER_FETCH_CONCURRENCY)
 
             async def fetch_semester(sid):
@@ -790,6 +813,11 @@ class DIUHeadlessScraper:
                 try:
                     res = r.json() if r else None
                     if res and res.get("status") is not False and res.get("data"):
+                        if not profile and isinstance(res["data"], list) and isinstance(res["data"][0], dict):
+                            first = res["data"][0]
+                            info = first.get("studentInformation") or {}
+                            profile["batch"] = str((info.get("batch") or {}).get("code") or "").strip()
+                            profile["program"] = str((info.get("program") or {}).get("name") or "").strip()
                         return self._parse_semester(res["data"], active_semesters.get(sid, f"Semester {sid}"))
                 except Exception:
                     pass
@@ -841,6 +869,10 @@ class DIUHeadlessScraper:
                                 "completed_credits": 0.0
                             }
 
+            # Batch and program as the portal lists them with the results
+            student_info["batch"] = profile.get("batch", "")
+            student_info["program"] = profile.get("program", "")
+
             # Persist fresh results to Database
             try:
                 await asyncio.to_thread(
@@ -858,9 +890,10 @@ class DIUHeadlessScraper:
 
             print(f"[TIMING] {clean_id}: all results loaded {time.monotonic() - t_launch:.1f}s after start ({len(semesters_found)} semesters)")
 
-            # Final completion signal
+            # Final completion signal (with the student details only known after the results were read)
             yield {
                 "type": "complete",
+                "student": student_info,
                 "overall_cgpa": final_overall_cgpa,
                 "total_credits": final_total_credits,
                 "total_completed_credits": final_completed_credits

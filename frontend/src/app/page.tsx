@@ -11,8 +11,10 @@ import {
   Sun,
   Moon,
   Eye,
-  EyeOff
+  EyeOff,
+  Download
 } from "lucide-react";
+import { downloadTranscript } from "@/lib/transcript";
 
 interface Course {
   name: string;
@@ -36,6 +38,8 @@ interface StudentData {
     department: string;
     campus: string;
     email?: string;
+    batch?: string;
+    program?: string;
   };
   overall_cgpa: number;
   total_credits: number;
@@ -615,6 +619,8 @@ export default function Home() {
                   if (!prev) return null;
                   return {
                     ...prev,
+                    // Batch and program are only known once the results were read
+                    student: payload.student ? { ...prev.student, ...payload.student } : prev.student,
                     overall_cgpa: payload.overall_cgpa,
                     total_credits: payload.total_credits,
                     total_completed_credits: payload.total_completed_credits
@@ -889,6 +895,22 @@ function Dashboard({
   isDark: boolean;
   onToggleTheme: () => void;
 }) {
+  const [isSavingTranscript, setIsSavingTranscript] = useState(false);
+  // The transcript needs every semester, so it is offered once loading has finished
+  const canDownloadTranscript = !isStreaming && data.semesters.some((s) => s.courses?.length > 0);
+
+  const saveTranscript = async () => {
+    setIsSavingTranscript(true);
+    try {
+      await downloadTranscript(data);
+    } catch (err) {
+      console.error("Transcript download failed", err);
+      alert("Could not create the transcript. Please try again.");
+    } finally {
+      setIsSavingTranscript(false);
+    }
+  };
+
   return (
     <div className={`min-h-screen ${isDark ? "bg-[#0e0e0e] text-[#ededed]" : "bg-slate-50 text-slate-900"}`}>
       <header className={`shadow-lg sticky top-0 z-10 ${
@@ -903,6 +925,20 @@ function Dashboard({
           </div>
           <div className="flex items-center space-x-3">
             <ThemeToggle isDark={isDark} onToggle={onToggleTheme} />
+            <button
+              onClick={saveTranscript}
+              disabled={!canDownloadTranscript || isSavingTranscript}
+              title={canDownloadTranscript ? "Download transcript (PDF)" : "Available once all results are loaded"}
+              aria-label="Download transcript"
+              className={`text-sm px-3 sm:px-4 py-2 rounded-md transition-colors font-medium border flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${
+                isDark
+                  ? "bg-[#3ecf8e] hover:bg-[#36b87e] border-[#3ecf8e] text-[#0e0e0e] cursor-pointer"
+                  : "bg-white hover:bg-teal-50 border-white text-teal-800 cursor-pointer"
+              }`}
+            >
+              {isSavingTranscript ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+              <span className="hidden sm:inline">Transcript</span>
+            </button>
             <button 
               onClick={onLogout}
               className={`text-sm px-4 py-2 rounded-md transition-colors font-medium border cursor-pointer ${
