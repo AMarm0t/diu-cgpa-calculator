@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { signIn, signOut, useSession } from "next-auth/react";
 import Link from "next/link";
 import { 
@@ -157,7 +157,7 @@ interface TaskRecord {
   task_id: string;
   student_id: string;
   client_ip: string | null;
-  source: "live" | "cache";
+  source: "live" | "cache" | "refresh";
   result: string;
   stage: string | null;
   message: string | null;
@@ -187,6 +187,16 @@ const TASK_RESULTS: Record<string, { label: string; cls: string }> = {
   network: { label: "Network error", cls: "bg-red-950/40 text-red-300 border-red-500/30" },
   portal_error: { label: "Portal error", cls: "bg-red-950/40 text-red-300 border-red-500/30" },
   failed: { label: "Failed", cls: "bg-red-950/40 text-red-300 border-red-500/30" },
+};
+
+// How the result was obtained (task.source), shown in the history "Source" column.
+const TASK_SOURCES: Record<string, { label: string; cls: string; title: string }> = {
+  live: { label: "Browser login", cls: "bg-amber-950/40 text-amber-300 border-amber-500/30",
+    title: "Full headless-browser login with Turnstile captcha" },
+  refresh: { label: "Token", cls: "bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30",
+    title: "Reused saved refresh token — no browser, no captcha" },
+  cache: { label: "Cache", cls: "bg-sky-950/40 text-sky-300 border-sky-500/30",
+    title: "Served from the database (DIU servers were unreachable)" },
 };
 
 export default function AdminPage() {
@@ -254,6 +264,9 @@ export default function AdminPage() {
   const [history, setHistory] = useState<TaskRecord[]>([]);
   const [historyCounts, setHistoryCounts] = useState<Record<string, number>>({});
   const [historyFilter, setHistoryFilter] = useState<string>("all");
+  const [historySearch, setHistorySearch] = useState<string>("");
+  const [historyPage, setHistoryPage] = useState<number>(1);
+  const [historyPageSize, setHistoryPageSize] = useState<number>(20);
   const [servers, setServers] = useState<ServerStatus[]>([]);
   const multiServer = API_BASES.length > 1;
 
@@ -511,7 +524,7 @@ export default function AdminPage() {
     const perServer = await Promise.all(
       API_BASES.map(async (base) => {
         try {
-          const res = await fetch(`${base}/api/admin/history?limit=100${qs}`, {
+          const res = await fetch(`${base}/api/admin/history?limit=500${qs}`, {
             headers: { Authorization: `Bearer ${token}` },
             cache: "no-store",
           });
@@ -529,7 +542,7 @@ export default function AdminPage() {
     const merged = ok
       .flatMap((r) => r.tasks)
       .sort((a, b) => (b.started_at || "").localeCompare(a.started_at || ""))
-      .slice(0, 100);
+      .slice(0, 500);
     const counts: Record<string, number> = {};
     for (const r of ok) {
       for (const [k, v] of Object.entries(r.counts)) counts[k] = (counts[k] || 0) + (v as number);
@@ -537,6 +550,13 @@ export default function AdminPage() {
     setHistory(merged);
     setHistoryCounts(counts);
   }, [token, historyFilter]);
+
+  // Client-side search by student ID (over the records already fetched)
+  const filteredHistory = useMemo(() => {
+    const q = historySearch.trim().toLowerCase();
+    if (!q) return history;
+    return history.filter((t) => (t.student_id || "").toLowerCase().includes(q));
+  }, [history, historySearch]);
 
   // Remove individual student from queue
   const handleRemoveFromQueue = async (id: string, base: string = API_BASE) => {
@@ -1894,24 +1914,59 @@ export default function AdminPage() {
                   <div className="flex items-center justify-between gap-3 flex-wrap">
                     <h4 className="text-xs font-mono font-semibold text-[#888888] uppercase tracking-wider flex items-center gap-2">
                       <Clock className="w-3.5 h-3.5 text-[#888888]" />
-                      Task History (last {history.length})
+                      Task History ({filteredHistory.length}{historySearch.trim() ? ` of ${history.length}` : ""})
                     </h4>
-                    <select
-                      value={historyFilter}
-                      onChange={(e) => setHistoryFilter(e.target.value)}
-                      className="bg-[#111111] border border-[#2b2b2b] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-[#3ecf8e]"
-                    >
-                      <option value="all">All results</option>
-                      <option value="failures">Failures only</option>
-                      {Object.entries(TASK_RESULTS).map(([key, meta]) => (
-                        <option key={key} value={key}>
-                          {meta.label}{historyCounts[key] ? ` (${historyCounts[key]})` : ""}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <input
+                        type="text"
+                        value={historySearch}
+                        onChange={(e) => { setHistorySearch(e.target.value); setHistoryPage(1); }}
+                        placeholder="Search Student ID…"
+                        className="bg-[#111111] border border-[#2b2b2b] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono placeholder:text-[#555555] focus:outline-none focus:border-[#3ecf8e] w-44"
+                      />
+                      <select
+                        value={historyFilter}
+                        onChange={(e) => { setHistoryFilter(e.target.value); setHistoryPage(1); }}
+                        className="bg-[#111111] border border-[#2b2b2b] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-[#3ecf8e]"
+                      >
+                        <option value="all">All results</option>
+                        <option value="failures">Failures only</option>
+                        {Object.entries(TASK_RESULTS).map(([key, meta]) => (
+                          <option key={key} value={key}>
+                            {meta.label}{historyCounts[key] ? ` (${historyCounts[key]})` : ""}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={historyPageSize}
+                        onChange={(e) => { setHistoryPageSize(Number(e.target.value)); setHistoryPage(1); }}
+                        className="bg-[#111111] border border-[#2b2b2b] rounded-lg px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-[#3ecf8e]"
+                        title="Rows per page"
+                      >
+                        <option value={10}>10 / page</option>
+                        <option value={20}>20 / page</option>
+                        <option value={50}>50 / page</option>
+                      </select>
+                    </div>
                   </div>
 
-                  {history.length > 0 ? (
+                  {(() => {
+                    const total = filteredHistory.length;
+                    const totalPages = Math.max(1, Math.ceil(total / historyPageSize));
+                    const page = Math.min(historyPage, totalPages);
+                    const start = (page - 1) * historyPageSize;
+                    const pageRows = filteredHistory.slice(start, start + historyPageSize);
+                    if (total === 0) {
+                      return (
+                        <div className="bg-[#161616] border border-[#242424] rounded-lg p-6 text-center text-xs text-[#666666] font-mono">
+                          {historySearch.trim()
+                            ? `No lookups match "${historySearch.trim()}".`
+                            : `No lookups recorded yet${historyFilter !== "all" ? " for this filter" : ""}.`}
+                        </div>
+                      );
+                    }
+                    return (
+                    <div className="space-y-3">
                     <div className="bg-[#161616] border border-[#242424] rounded-lg overflow-x-auto">
                       <table className="w-full text-left text-xs font-mono">
                         <thead className="bg-[#1b1b1b] border-b border-[#242424] text-[10px] text-[#888888] uppercase">
@@ -1920,6 +1975,7 @@ export default function AdminPage() {
                             {multiServer && <th className="px-4 py-2.5">Server</th>}
                             <th className="px-4 py-2.5">Student ID</th>
                             <th className="px-4 py-2.5">Result</th>
+                            <th className="px-4 py-2.5">Source</th>
                             <th className="px-4 py-2.5">Duration</th>
                             <th className="px-4 py-2.5">Reached</th>
                             <th className="px-4 py-2.5">Captcha</th>
@@ -1927,7 +1983,7 @@ export default function AdminPage() {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-[#222222]">
-                          {history.map((t) => {
+                          {pageRows.map((t) => {
                             const meta = TASK_RESULTS[t.result] || TASK_RESULTS.failed;
                             return (
                               <tr key={t.task_id} className="hover:bg-[#1a1a1a] align-top">
@@ -1942,6 +1998,18 @@ export default function AdminPage() {
                                   <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] border whitespace-nowrap ${meta.cls}`}>
                                     {meta.label}
                                   </span>
+                                </td>
+                                <td className="px-4 py-3">
+                                  {(() => {
+                                    const sm = TASK_SOURCES[t.source];
+                                    return sm ? (
+                                      <span title={sm.title} className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] border whitespace-nowrap ${sm.cls}`}>
+                                        {sm.label}
+                                      </span>
+                                    ) : (
+                                      <span className="text-[#666666]">-</span>
+                                    );
+                                  })()}
                                 </td>
                                 <td className="px-4 py-3 text-[#cccccc] whitespace-nowrap">
                                   {t.duration_s != null ? `${t.duration_s}s` : "-"}
@@ -1962,11 +2030,45 @@ export default function AdminPage() {
                         </tbody>
                       </table>
                     </div>
-                  ) : (
-                    <div className="bg-[#161616] border border-[#242424] rounded-lg p-6 text-center text-xs text-[#666666] font-mono">
-                      No lookups recorded yet{historyFilter !== "all" ? " for this filter" : ""}.
+                    <div className="flex items-center justify-between gap-3 flex-wrap text-xs font-mono text-[#888888]">
+                      <span>
+                        Showing {start + 1}–{Math.min(start + historyPageSize, total)} of {total}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => setHistoryPage(1)}
+                          disabled={page <= 1}
+                          className="px-2 py-1 rounded border border-[#2b2b2b] bg-[#111111] hover:bg-[#1a1a1a] disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          « First
+                        </button>
+                        <button
+                          onClick={() => setHistoryPage(page - 1)}
+                          disabled={page <= 1}
+                          className="px-2 py-1 rounded border border-[#2b2b2b] bg-[#111111] hover:bg-[#1a1a1a] disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          ‹ Prev
+                        </button>
+                        <span className="px-2 text-[#cccccc]">Page {page} / {totalPages}</span>
+                        <button
+                          onClick={() => setHistoryPage(page + 1)}
+                          disabled={page >= totalPages}
+                          className="px-2 py-1 rounded border border-[#2b2b2b] bg-[#111111] hover:bg-[#1a1a1a] disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          Next ›
+                        </button>
+                        <button
+                          onClick={() => setHistoryPage(totalPages)}
+                          disabled={page >= totalPages}
+                          className="px-2 py-1 rounded border border-[#2b2b2b] bg-[#111111] hover:bg-[#1a1a1a] disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          Last »
+                        </button>
+                      </div>
                     </div>
-                  )}
+                    </div>
+                    );
+                  })()}
                 </div>
               </div>
             )}
