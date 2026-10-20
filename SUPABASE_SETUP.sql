@@ -14,8 +14,12 @@ CREATE TABLE IF NOT EXISTS public.student_results (
     total_credits NUMERIC(6, 1),
     completed_credits NUMERIC(6, 1),
     results_json JSONB NOT NULL,
-    last_fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    last_fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    refresh_token TEXT
 );
+
+-- Existing databases (created before the refresh-token feature): add the column.
+ALTER TABLE public.student_results ADD COLUMN IF NOT EXISTS refresh_token TEXT;
 
 -- 2. Create index on last_fetched_at for fast queries
 CREATE INDEX IF NOT EXISTS idx_student_results_fetched 

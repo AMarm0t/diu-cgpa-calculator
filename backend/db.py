@@ -7,10 +7,17 @@ import json
 import sqlite3
 import hmac
 import hashlib
+import base64
 import shutil
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except Exception:  # cryptography not installed — tokens fall back to plaintext
+    Fernet = None
+    InvalidToken = Exception
 
 # Load environment variables
 load_dotenv()
@@ -73,11 +80,48 @@ def verify_password(password: str, stored_hash: str) -> bool:
     except (ValueError, TypeError):
         return False
 
+_TOKEN_ENC_PREFIX = "enc:"
+
+def _token_cipher():
+    """Fernet cipher derived from PASSWORD_PEPPER, or None when encryption isn't possible.
+    When None, refresh tokens are stored as plaintext (the legacy behavior)."""
+    if Fernet is None or not PASSWORD_PEPPER:
+        return None
+    key = base64.urlsafe_b64encode(hashlib.sha256(b"token-enc:" + PASSWORD_PEPPER.encode()).digest())
+    return Fernet(key)
+
+def _encrypt_token(token: str) -> str:
+    """Encrypts a refresh token for storage. Returns plaintext unchanged if no key is configured."""
+    cipher = _token_cipher()
+    if not cipher or not token:
+        return token
+    return _TOKEN_ENC_PREFIX + cipher.encrypt(token.encode()).decode()
+
+def _decrypt_token(stored: Optional[str]) -> Optional[str]:
+    """Decrypts a stored refresh token. Legacy plaintext values (no prefix) pass through."""
+    if not stored:
+        return None
+    if not stored.startswith(_TOKEN_ENC_PREFIX):
+        return stored  # legacy plaintext token
+    cipher = _token_cipher()
+    if not cipher:
+        return None  # encrypted but no key available — treat as unusable
+    try:
+        return cipher.decrypt(stored[len(_TOKEN_ENC_PREFIX):].encode()).decode()
+    except InvalidToken:
+        return None
+
 def init_db():
     """Initializes local SQLite database if Supabase is not configured."""
     client = get_supabase()
     if client:
         print("[DB] Using Supabase Cloud Database.")
+        try:
+            client.table("student_results").select("refresh_token").limit(1).execute()
+        except Exception:
+            print("[DB] WARNING: 'refresh_token' column is missing in Supabase — refresh-token "
+                  "login is DISABLED until you run: "
+                  "ALTER TABLE student_results ADD COLUMN refresh_token TEXT;")
         return
 
     os.makedirs(os.path.dirname(SQLITE_PATH), exist_ok=True)
@@ -218,7 +262,7 @@ def get_refresh_token(student_id: str) -> Optional[str]:
         try:
             res = client.table("student_results").select("refresh_token").eq("student_id", clean_id).execute()
             if res.data and res.data[0].get("refresh_token"):
-                return res.data[0]["refresh_token"]
+                return _decrypt_token(res.data[0]["refresh_token"])
         except Exception:
             pass
         return None
@@ -230,18 +274,19 @@ def get_refresh_token(student_id: str) -> Optional[str]:
             cursor = conn.cursor()
             cursor.execute("SELECT refresh_token FROM student_results WHERE student_id = ?", (clean_id,))
             row = cursor.fetchone()
-            return row[0] if row and row[0] else None
+            return _decrypt_token(row[0]) if row and row[0] else None
     except sqlite3.OperationalError:
         return None  # column doesn't exist yet
 
 
 def save_refresh_token(student_id: str, token: str) -> bool:
-    """Saves (or clears) a refresh token for a student."""
+    """Saves (or clears) a refresh token for a student. Stored encrypted when a key is configured."""
     clean_id = student_id.strip()
+    stored = _encrypt_token(token) if token else token  # keep "" as a clear
     client = get_supabase()
     if client:
         try:
-            client.table("student_results").update({"refresh_token": token}).eq("student_id", clean_id).execute()
+            client.table("student_results").update({"refresh_token": stored}).eq("student_id", clean_id).execute()
             return True
         except Exception:
             pass
@@ -252,7 +297,7 @@ def save_refresh_token(student_id: str, token: str) -> bool:
     try:
         with sqlite3.connect(SQLITE_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("UPDATE student_results SET refresh_token = ? WHERE student_id = ?", (token, clean_id))
+            cursor.execute("UPDATE student_results SET refresh_token = ? WHERE student_id = ?", (stored, clean_id))
             conn.commit()
             return cursor.rowcount > 0
     except sqlite3.OperationalError:
