@@ -97,6 +97,11 @@ def init_db():
                 last_fetched_at TIMESTAMP NOT NULL
             );
         """)
+        # Migration: add refresh_token column for existing databases
+        try:
+            cursor.execute("ALTER TABLE student_results ADD COLUMN refresh_token TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
     print(f"[DB] Using Local SQLite Database at: {SQLITE_PATH}")
 
@@ -204,6 +209,55 @@ def upsert_student(
         ))
         conn.commit()
         return True
+
+def get_refresh_token(student_id: str) -> Optional[str]:
+    """Retrieves the saved refresh token for a student, or None."""
+    clean_id = student_id.strip()
+    client = get_supabase()
+    if client:
+        try:
+            res = client.table("student_results").select("refresh_token").eq("student_id", clean_id).execute()
+            if res.data and res.data[0].get("refresh_token"):
+                return res.data[0]["refresh_token"]
+        except Exception:
+            pass
+        return None
+
+    if not os.path.exists(SQLITE_PATH):
+        return None
+    try:
+        with sqlite3.connect(SQLITE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT refresh_token FROM student_results WHERE student_id = ?", (clean_id,))
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
+    except sqlite3.OperationalError:
+        return None  # column doesn't exist yet
+
+
+def save_refresh_token(student_id: str, token: str) -> bool:
+    """Saves (or clears) a refresh token for a student."""
+    clean_id = student_id.strip()
+    client = get_supabase()
+    if client:
+        try:
+            client.table("student_results").update({"refresh_token": token}).eq("student_id", clean_id).execute()
+            return True
+        except Exception:
+            pass
+        return False
+
+    if not os.path.exists(SQLITE_PATH):
+        return False
+    try:
+        with sqlite3.connect(SQLITE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE student_results SET refresh_token = ? WHERE student_id = ?", (token, clean_id))
+            conn.commit()
+            return cursor.rowcount > 0
+    except sqlite3.OperationalError:
+        return False  # column doesn't exist yet
+
 
 def list_all_students() -> List[Dict[str, Any]]:
     """Returns a list of all stored students for admin overview (omits password_hash & full json)."""

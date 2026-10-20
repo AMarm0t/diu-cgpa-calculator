@@ -26,5 +26,8 @@ scratch/
 # Local research scripts & captured portal data (contain real credentials/PII - never commit)
 research/
 
+# Tokens and test scripts (contain live credentials - never commit)
+refresh_token.txt
+
 # Local Claude Code / tool config
 .claude/

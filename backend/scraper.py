@@ -20,9 +20,11 @@ from queue_manager import queue_manager, QueueCancelledException, QueueFullExcep
 import task_history
 from cgpa_calculator import calculate_overall_cgpa
 
-LOGIN_URL = "https://auth1.diu.edu.bd/realms/diu-student/protocol/openid-connect/auth?client_id=student-portal-ui&redirect_uri=https%3A%2F%2Fstudentportal.diu.edu.bd%2F&response_type=code&scope=openid+profile+email"
+LOGIN_URL = "https://auth1.diu.edu.bd/realms/diu-student/protocol/openid-connect/auth?client_id=diu-student-app&redirect_uri=diustudentapp%3A%2F%2Fcallback&response_type=code&scope=openid+profile+email+offline_access"
 TOKEN_URL = "https://auth1.diu.edu.bd/realms/diu-student/protocol/openid-connect/token"
 GATEWAY_BASE = "https://gateway7.diu.edu.bd/api/student/portal"
+APP_CLIENT_ID = "diu-student-app"
+APP_REDIRECT_URI = "diustudentapp://callback"
 
 # Registry for active interactive browser sessions
 active_browser_sessions: dict[str, dict] = {}
@@ -229,62 +231,102 @@ class DIUHeadlessScraper:
     async def _scrape_stream_inner(self, student_id: str, password: str, task: dict):
         clean_id = student_id.strip()
 
-        # Step 0: Transparent Database Cache Check (dynamic TTL from system settings)
+        # Load cached record (used for password verification and DIU-down fallback only — never short-circuits fresh data)
         try:
             cached = await asyncio.to_thread(db.get_student, clean_id)
-            if cached and await asyncio.to_thread(db.verify_password, password.strip(), cached.get("password_hash", "")):
-                last_fetched = cached.get("last_fetched_at")
-                is_fresh = False
-                if last_fetched:
-                    try:
-                        clean_ts = str(last_fetched).replace("Z", "+00:00")
-                        dt = datetime.fromisoformat(clean_ts)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        age = (datetime.now(timezone.utc) - dt).total_seconds()
-                        settings = await asyncio.to_thread(db.get_system_settings)
-                        ttl_minutes = int(settings.get("cache_ttl_minutes", 60))
-                        if ttl_minutes <= 0:
-                            # "Never expire": only an admin reset (which dates the entry to 1970) refreshes it
-                            is_fresh = dt.year > 1970
-                        elif age < max(60, ttl_minutes * 60):
-                            is_fresh = True
-                    except Exception as err:
-                        print(f"[CACHE] Timestamp parse error: {err}")
+        except Exception as e:
+            print(f"[CACHE] Cache lookup failed: {e}")
+            cached = None
 
-                if is_fresh:
+        # Step 1: Fast password validation via admin-cli (catches wrong passwords in <1s)
+        password_verified = False
+        if cached and await asyncio.to_thread(db.verify_password, password.strip(), cached.get("password_hash", "")):
+            password_verified = True
+        else:
+            try:
+                async with httpx.AsyncClient(timeout=5) as pw_client:
+                    pw_resp = await pw_client.post(TOKEN_URL, data={
+                        "grant_type": "password",
+                        "client_id": "admin-cli",
+                        "username": student_id.strip(),
+                        "password": password.strip(),
+                        "scope": "openid",
+                    })
+                    pw_data = pw_resp.json()
+                    if "error" in pw_data:
+                        desc = pw_data.get("error_description", "")
+                        if "invalid" in desc.lower() or "credential" in desc.lower():
+                            print(f"[AUTH] {clean_id}: password rejected by admin-cli pre-check")
+                            yield {"type": "error", "code": "wrong_password", "message": "Invalid Student ID or Password."}
+                            return
+                        # Other error (client disabled, rate limited) — skip pre-check, let browser validate
+                    else:
+                        password_verified = True
+                        print(f"[AUTH] {clean_id}: password validated via admin-cli in <1s")
+            except Exception as e:
+                print(f"[AUTH] {clean_id}: admin-cli pre-check skipped ({type(e).__name__})")
+
+        # Step 2: Try refresh token (skips browser + captcha entirely)
+        if password_verified:
+            try:
+                saved_rt = await asyncio.to_thread(db.get_refresh_token, clean_id)
+                if saved_rt:
+                    yield {"type": "status", "message": "Connecting to DIU Student Portal..."}
+                    async with httpx.AsyncClient(timeout=15) as rt_client:
+                        rt_resp = await rt_client.post(TOKEN_URL, data={
+                            "grant_type": "refresh_token",
+                            "client_id": APP_CLIENT_ID,
+                            "refresh_token": saved_rt,
+                        })
+                        rt_data = rt_resp.json()
+                        if "access_token" in rt_data:
+                            access_token = rt_data["access_token"]
+                            # Save rotated refresh token
+                            new_rt = rt_data.get("refresh_token")
+                            if new_rt:
+                                await asyncio.to_thread(db.save_refresh_token, clean_id, new_rt)
+                            # Verify the token works against the gateway
+                            headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+                            test_resp = await rt_client.get(f"{GATEWAY_BASE}/semester/active", headers=headers)
+                            if test_resp.status_code == 200:
+                                print(f"[AUTH] {clean_id}: refresh token worked — skipping browser entirely")
+                                task["source"] = "refresh"
+                                async for event in self._gateway_fetch_stream(
+                                    clean_id, student_id, password, access_token, task
+                                ):
+                                    yield event
+                                return
+                            else:
+                                print(f"[AUTH] {clean_id}: refresh token valid but gateway rejected ({test_resp.status_code}) — falling back to browser")
+                        else:
+                            print(f"[AUTH] {clean_id}: refresh token expired/revoked ({rt_data.get('error', '?')}) — falling back to browser")
+                            await asyncio.to_thread(db.save_refresh_token, clean_id, "")
+            except httpx.ConnectError:
+                # DIU servers unreachable — try DB cache as last resort
+                print(f"[AUTH] {clean_id}: DIU unreachable — serving cached results if available")
+                if cached:
                     results = cached.get("results_json", {})
                     if results and "student" in results:
                         task["source"] = "cache"
-                        yield {"type": "status", "message": "Connecting to DIU Student Portal..."}
+                        yield {"type": "status", "message": "DIU servers are slow. Showing your last results..."}
                         await asyncio.sleep(0.04)
                         yield {"type": "student", "data": results.get("student", {})}
-
                         seen_semesters = []
                         for sem in results.get("semesters", []):
                             await asyncio.sleep(0.02)
                             seen_semesters.append(sem)
                             stats = calculate_overall_cgpa(seen_semesters)
-
-                            yield {
-                                "type": "semester",
-                                "data": sem,
-                                "running_cgpa": stats["overall_cgpa"],
-                                "total_credits": stats["total_credits"],
-                                "completed_credits": stats["total_earned_credits"]
-                            }
-
+                            yield {"type": "semester", "data": sem, "running_cgpa": stats["overall_cgpa"],
+                                   "total_credits": stats["total_credits"], "completed_credits": stats["total_earned_credits"]}
                         final_stats = calculate_overall_cgpa(results.get("semesters", []))
-                        yield {
-                            "type": "complete",
-                            "overall_cgpa": final_stats["overall_cgpa"],
-                            "total_credits": final_stats["total_credits"],
-                            "total_completed_credits": final_stats["total_earned_credits"]
-                        }
+                        yield {"type": "complete", "overall_cgpa": final_stats["overall_cgpa"],
+                               "total_credits": final_stats["total_credits"],
+                               "total_completed_credits": final_stats["total_earned_credits"]}
                         return
-        except Exception as e:
-            print(f"[CACHE] Cache check bypassed due to error: {e}")
+            except Exception as e:
+                print(f"[AUTH] {clean_id}: refresh token attempt failed ({type(e).__name__}: {e}) — falling back to browser")
 
+        # Step 3: Full browser login (Turnstile + credentials) — the ultimate fallback
         if clean_id in _students_in_flight:
             yield {"type": "error", "code": "duplicate", "message": "A login for this Student ID is already in progress. Please wait for it to finish."}
             return
@@ -374,7 +416,7 @@ class DIUHeadlessScraper:
 
                 def check_url(url):
                     nonlocal auth_code
-                    if 'code=' in url and 'studentportal' in url:
+                    if 'code=' in url and ('studentportal' in url or 'diustudentapp' in url):
                         parsed = urlparse(url)
                         params = parse_qs(parsed.query)
                         if 'code' in params:
@@ -394,6 +436,7 @@ class DIUHeadlessScraper:
                         pass
 
                 page.on("framenavigated", lambda frame: check_url(frame.url))
+                page.on("response", lambda resp: check_url(resp.headers.get("location", "")) if resp.status in (301, 302, 303, 307, 308) else None)
 
                 try:
                     alive(130, "loading the DIU login page")  # bounded by its own timeouts
@@ -696,15 +739,14 @@ class DIUHeadlessScraper:
             return
 
         print(f"[TIMING] {clean_id}: logged in {time.monotonic() - t_launch:.1f}s after start")
-        yield {"type": "status", "step": "fetch", "message": "Access granted! Fetching academic profile..."}
 
         # Step 2: Exchange Auth Code for Access Token from Keycloak
         async with httpx.AsyncClient(timeout=15) as client:
             token_resp = await client.post(TOKEN_URL, data={
                 "grant_type": "authorization_code",
-                "client_id": "student-portal-ui",
+                "client_id": APP_CLIENT_ID,
                 "code": auth_code,
-                "redirect_uri": "https://studentportal.diu.edu.bd/",
+                "redirect_uri": APP_REDIRECT_URI,
             })
 
             if token_resp.status_code != 200:
@@ -714,6 +756,25 @@ class DIUHeadlessScraper:
             token_data = token_resp.json()
             access_token = token_data.get("access_token")
 
+            # Save the never-expiring refresh token for next time (skips browser entirely)
+            refresh_token = token_data.get("refresh_token")
+            if refresh_token:
+                try:
+                    await asyncio.to_thread(db.save_refresh_token, clean_id, refresh_token)
+                    print(f"[AUTH] {clean_id}: saved refresh token (expires_in={token_data.get('refresh_expires_in', '?')})")
+                except Exception as e:
+                    print(f"[AUTH] {clean_id}: failed to save refresh token: {e}")
+
+            async for event in self._gateway_fetch_stream(clean_id, student_id, password, access_token, task):
+                yield event
+
+    async def _gateway_fetch_stream(self, clean_id: str, student_id: str, password: str, access_token: str, task: dict):
+        """Fetches profile + all semester results from the gateway and streams them.
+        Shared by both the refresh-token path and the browser-login path."""
+        t_fetch = time.monotonic()
+        yield {"type": "status", "step": "fetch", "message": "Access granted! Fetching academic profile..."}
+
+        async with httpx.AsyncClient(timeout=15) as client:
             headers = {
                 "Authorization": f"Bearer {access_token}",
                 "Accept": "application/json",
@@ -722,7 +783,6 @@ class DIUHeadlessScraper:
                 "Referer": "https://studentportal.diu.edu.bd/",
             }
 
-            # Step 3: Fetch Student Info & Metadata
             student_info = {
                 "id": student_id,
                 "name": "",
@@ -738,22 +798,36 @@ class DIUHeadlessScraper:
                 except Exception:
                     return None
 
-            # Profile + semester catalog + history in parallel instead of 4 sequential round-trips
-            account_resp, active_resp, sem_resp, graph_resp = await asyncio.gather(
-                get_or_none(f"{GATEWAY_BASE}/account"),
+            profile_resp, active_resp, sem_resp, graph_resp = await asyncio.gather(
+                get_or_none(f"{GATEWAY_BASE}/student/information/profile"),
                 get_or_none(f"{GATEWAY_BASE}/semester/active"),
                 get_or_none(f"{GATEWAY_BASE}/semester"),
-                get_or_none(f"{GATEWAY_BASE}/graph"),
+                get_or_none(f"{GATEWAY_BASE}/result/graph"),
             )
 
-            if account_resp:
-                acc = account_resp.json()
-                student_info["name"] = f"{acc.get('firstName', '')} {acc.get('lastName', '')}".strip()
-                student_info["department"] = acc.get('attributes', {}).get('department_code', ['CSE'])[0] if isinstance(acc.get('attributes', {}).get('department_code'), list) else 'CSE'
-                student_info["campus"] = acc.get('attributes', {}).get('campus', ['DSC'])[0] if isinstance(acc.get('attributes', {}).get('campus'), list) else 'DSC'
-                student_info["email"] = acc.get('email', '')
+            if profile_resp:
+                try:
+                    pdata = profile_resp.json().get("data", {})
+                    person = pdata.get("studentPerson", {})
+                    student_info["name"] = person.get("fullName", "").strip()
+                    student_info["email"] = person.get("email", "") or person.get("personalEmail", "")
+                    infos = person.get("studentInformations", [{}])
+                    first_info = infos[0] if infos else {}
+                    dept = first_info.get("department", {})
+                    student_info["department"] = dept.get("code", "") or dept.get("name", "CSE")
+                    campus = first_info.get("campus", {})
+                    student_info["campus"] = campus.get("code", "") or campus.get("name", "DSC")
+                except Exception as e:
+                    print(f"[SCRAPER] {clean_id}: profile parse error: {e}")
 
-            # Fallback to Keycloak userinfo endpoint
+            if not student_info["name"]:
+                account_resp = await get_or_none(f"{GATEWAY_BASE}/account")
+                if account_resp:
+                    acc = account_resp.json()
+                    student_info["name"] = f"{acc.get('firstName', '')} {acc.get('lastName', '')}".strip()
+                    student_info["department"] = acc.get('attributes', {}).get('department_code', ['CSE'])[0] if isinstance(acc.get('attributes', {}).get('department_code'), list) else 'CSE'
+                    student_info["campus"] = acc.get('attributes', {}).get('campus', ['DSC'])[0] if isinstance(acc.get('attributes', {}).get('campus'), list) else 'DSC'
+                    student_info["email"] = acc.get('email', '')
             if not student_info["name"]:
                 u_resp = await get_or_none(
                     "https://auth1.diu.edu.bd/realms/diu-student/protocol/openid-connect/userinfo",
@@ -764,11 +838,8 @@ class DIUHeadlessScraper:
                     student_info["name"] = uinfo.get("name", "").strip()
                     student_info["email"] = uinfo.get("email", "")
 
-            # Stream student info right now so frontend immediately displays dashboard!
             yield {"type": "student", "data": student_info}
 
-            # Step 4: Semester catalog. /semester/active lists every DIU semester as
-            # {id, name: "Fall 2023", code: "233"}; results are requested by that id.
             active_semesters = {}
             semester_codes = {}
             if active_resp:
@@ -792,14 +863,9 @@ class DIUHeadlessScraper:
 
             graph_data = graph_resp.json().get('data', []) if graph_resp else []
 
-            # Step 5: Scan every candidate semester concurrently, streaming results in semester order
             semesters_found = []
-            # Batch and program come with every course result (studentInformation), taken from the first one
             profile = {}
 
-            # Ids below 60 are semesters from before 2021; the catalog adds ones newer than the fixed range.
-            # Results stream in date order: by DIU code (233 = Fall 2023, 241 = Spring 2024, 244 = Short
-            # 2024), since ids need not follow the calendar; ids the catalog doesn't know go last.
             candidate_ids = sorted(
                 {sid for sid in active_semesters if sid >= 60} | set(range(60, 90))
                 | ({current_semester_id} if current_semester_id else set()),
@@ -825,9 +891,8 @@ class DIUHeadlessScraper:
 
             tasks = [asyncio.create_task(fetch_semester(sid)) for sid in candidate_ids]
             try:
-                # Awaiting in order still streams progressively: later fetches run while earlier ones are awaited
-                for task in tasks:
-                    semester_item = await task
+                for t in tasks:
+                    semester_item = await t
                     if not semester_item:
                         continue
                     semesters_found.append(semester_item)
@@ -840,10 +905,9 @@ class DIUHeadlessScraper:
                         "completed_credits": stats["total_earned_credits"]
                     }
             finally:
-                for task in tasks:
-                    task.cancel()
+                for t in tasks:
+                    t.cancel()
 
-            # Step 6: If no course grades yet, check graph
             final_stats = calculate_overall_cgpa(semesters_found)
             final_overall_cgpa = final_stats["overall_cgpa"]
             final_total_credits = final_stats["total_credits"]
@@ -869,11 +933,9 @@ class DIUHeadlessScraper:
                                 "completed_credits": 0.0
                             }
 
-            # Batch and program as the portal lists them with the results
             student_info["batch"] = profile.get("batch", "")
             student_info["program"] = profile.get("program", "")
 
-            # Persist fresh results to Database
             try:
                 await asyncio.to_thread(
                     db.upsert_student,
@@ -888,9 +950,8 @@ class DIUHeadlessScraper:
             except Exception as e:
                 print(f"[DB] Error upserting student: {e}")
 
-            print(f"[TIMING] {clean_id}: all results loaded {time.monotonic() - t_launch:.1f}s after start ({len(semesters_found)} semesters)")
+            print(f"[TIMING] {clean_id}: all results loaded {time.monotonic() - t_fetch:.1f}s after fetch start ({len(semesters_found)} semesters)")
 
-            # Final completion signal (with the student details only known after the results were read)
             yield {
                 "type": "complete",
                 "student": student_info,
