@@ -369,15 +369,22 @@ export default function Home() {
     const relX = (clientX - rect.left) * scaleX;
     const relY = (clientY - rect.top) * scaleY;
 
+    // A normal Turnstile checkbox widget is short (~65px). If it's taller, Turnstile has escalated
+    // to an interactive/image challenge, so we must relay the exact spot the user tapped rather than
+    // snapping to the checkbox position.
+    const isCheckboxWidget = (challengeData.box.height || 65) < 100;
+
     // Standard Cloudflare Turnstile checkbox center inside widget (x: 21, y: 33)
     let clickX = (challengeData.box.x || 0) + 21;
     let clickY = (challengeData.box.y || 0) + 33;
 
     if (relX >= 0 && relY >= 0) {
-      if (relX < 210 && relY < 70) {
+      if (isCheckboxWidget && relX < 210 && relY < 70) {
+        // Checkbox: forgive imprecise taps by snapping to the known checkbox center.
         clickX = (challengeData.box.x || 0) + 21;
         clickY = (challengeData.box.y || 0) + 33;
       } else {
+        // Image/interactive challenge, or a tap outside the checkbox: use the exact position.
         clickX = (challengeData.box.x || 0) + relX;
         clickY = (challengeData.box.y || 0) + relY;
       }

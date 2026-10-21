@@ -707,8 +707,12 @@ class DIUHeadlessScraper:
                                     if solved:
                                         yield {"type": "challenge_solved"}
                                     elif auto_click_now:
-                                        # Auto-click didn't pass: hand off to the user instead of a visible retry.
-                                        print(f"[TURNSTILE] {clean_id}: auto-click not accepted - showing the checkbox to the user")
+                                        # Auto-click didn't pass. Go straight back to streaming the live widget to
+                                        # the user (auto_clicked stays True, so the next pass shows the popup) rather
+                                        # than falling through to submit credentials without a token or misread a
+                                        # transient Turnstile message as a login error.
+                                        print(f"[TURNSTILE] {clean_id}: auto-click not accepted - handing the checkbox to the user")
+                                        continue
                                     else:
                                         # Close the modal; the next round streams a fresh live view
                                         yield {"type": "challenge_retry", "message": "Verification still pending. Loading a fresh check..."}
