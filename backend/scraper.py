@@ -8,6 +8,7 @@ import os
 import base64
 import io
 import hashlib
+import random
 import uuid
 import time
 from datetime import datetime, timezone
@@ -78,6 +79,15 @@ TOKEN_JS = """() => {
 
 # When set, extra per-step Turnstile diagnostics are logged
 TURNSTILE_DEBUG_DIR = os.environ.get("TURNSTILE_DEBUG_DIR", "")
+
+# When enabled the server fires the humanized checkbox click itself the first time the checkbox
+# appears, instead of waiting for the user; the interactive popup is shown only if that auto-click
+# does not solve Turnstile (or an image/interactive challenge appears). Set TURNSTILE_AUTOCLICK=0
+# to always ask the user (the original behavior). The human relay is unchanged — it is the fallback.
+AUTOCLICK_ENABLED = os.environ.get("TURNSTILE_AUTOCLICK", "1").strip().lower() not in ("0", "false", "no", "off")
+# Human-like reaction delay before the auto-click (Camoufox's humanized move adds ~1s more on top).
+AUTOCLICK_MIN_DELAY = float(os.environ.get("TURNSTILE_AUTOCLICK_MIN_DELAY", "0.7"))
+AUTOCLICK_MAX_DELAY = float(os.environ.get("TURNSTILE_AUTOCLICK_MAX_DELAY", "1.6"))
 
 def looks_like_spinner(png: bytes) -> bool:
     """
@@ -461,6 +471,9 @@ class DIUHeadlessScraper:
                     # never leaves the user on a silent spinner (user click waits are excluded below).
                     phase_deadline = time.monotonic() + SECURITY_CHECK_TIMEOUT
 
+                    # Auto-click the checkbox at most once per login; after that the popup takes over.
+                    auto_clicked = False
+
                     # Loop through challenge and login steps
                     for attempt in range(45):
                         alive(doing="signing in")
@@ -509,6 +522,7 @@ class DIUHeadlessScraper:
                             last_hash = None
                             shown_at = None
                             clicked = False
+                            auto_click_now = False  # set when this break is the server's own auto-click
                             showing_spinner = True
                             last_change_at = time.monotonic()
                             nudged = False
@@ -579,7 +593,19 @@ class DIUHeadlessScraper:
                                                 active_browser_sessions[session_id]["box"] = box
                                                 if shown_at is None:
                                                     shown_at = time.monotonic()
-                                                    print(f"[TURNSTILE] {clean_id}: checkbox shown to user ({shown_at - t_launch:.1f}s)")
+                                                    print(f"[TURNSTILE] {clean_id}: checkbox shown ({shown_at - t_launch:.1f}s)")
+                                                if AUTOCLICK_ENABLED and not auto_clicked:
+                                                    # Fire the same humanized checkbox click ourselves; the popup is
+                                                    # only shown if this doesn't solve it (see the retry path below).
+                                                    auto_clicked = True
+                                                    auto_click_now = True
+                                                    await asyncio.sleep(random.uniform(AUTOCLICK_MIN_DELAY, AUTOCLICK_MAX_DELAY))
+                                                    active_browser_sessions[session_id]["click_coords"] = {
+                                                        "x": box["x"] + 21, "y": box["y"] + 33,  # standard checkbox center
+                                                    }
+                                                    clicked = True
+                                                    print(f"[TURNSTILE] {clean_id}: auto-clicking checkbox (no popup shown)")
+                                                    break
                                                 yield {
                                                     "type": "challenge_required",
                                                     "session_id": session_id,
@@ -616,7 +642,8 @@ class DIUHeadlessScraper:
                                 # otherwise nothing was shown before the deadline; the loop top reports it
                             else:
                                 t_clicked = time.monotonic()
-                                task["clicks"] = task.get("clicks", 0) + 1
+                                if not auto_click_now:
+                                    task["clicks"] = task.get("clicks", 0) + 1  # only real human clicks are counted
                                 phase_deadline += t_clicked - shown_at  # the user's thinking time doesn't count
                                 coords = active_browser_sessions[session_id].get("click_coords")
                                 if coords:
@@ -675,9 +702,13 @@ class DIUHeadlessScraper:
                                             solved = True
                                             break
 
-                                    print(f"[TURNSTILE] {clean_id}: user clicked at {t_clicked - t_launch:.1f}s -> {'solved' if solved else 'still pending'} at {time.monotonic() - t_launch:.1f}s")
+                                    who = "auto-click" if auto_click_now else "user clicked"
+                                    print(f"[TURNSTILE] {clean_id}: {who} at {t_clicked - t_launch:.1f}s -> {'solved' if solved else 'still pending'} at {time.monotonic() - t_launch:.1f}s")
                                     if solved:
                                         yield {"type": "challenge_solved"}
+                                    elif auto_click_now:
+                                        # Auto-click didn't pass: hand off to the user instead of a visible retry.
+                                        print(f"[TURNSTILE] {clean_id}: auto-click not accepted - showing the checkbox to the user")
                                     else:
                                         # Close the modal; the next round streams a fresh live view
                                         yield {"type": "challenge_retry", "message": "Verification still pending. Loading a fresh check..."}
