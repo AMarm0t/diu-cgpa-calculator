@@ -756,21 +756,20 @@ class DIUHeadlessScraper:
             token_data = token_resp.json()
             access_token = token_data.get("access_token")
 
-            # Save the never-expiring refresh token for next time (skips browser entirely)
+            # The never-expiring refresh token is persisted atomically with the result row inside
+            # _gateway_fetch_stream (upsert creates the row AND saves the token in one write), so a
+            # first-ever login no longer loses it to an UPDATE against a not-yet-existing row.
             refresh_token = token_data.get("refresh_token")
             if refresh_token:
-                try:
-                    await asyncio.to_thread(db.save_refresh_token, clean_id, refresh_token)
-                    print(f"[AUTH] {clean_id}: saved refresh token (expires_in={token_data.get('refresh_expires_in', '?')})")
-                except Exception as e:
-                    print(f"[AUTH] {clean_id}: failed to save refresh token: {e}")
+                print(f"[AUTH] {clean_id}: got refresh token (expires_in={token_data.get('refresh_expires_in', '?')})")
 
-            async for event in self._gateway_fetch_stream(clean_id, student_id, password, access_token, task):
+            async for event in self._gateway_fetch_stream(clean_id, student_id, password, access_token, task, refresh_token=refresh_token):
                 yield event
 
-    async def _gateway_fetch_stream(self, clean_id: str, student_id: str, password: str, access_token: str, task: dict):
+    async def _gateway_fetch_stream(self, clean_id: str, student_id: str, password: str, access_token: str, task: dict, refresh_token: str | None = None):
         """Fetches profile + all semester results from the gateway and streams them.
-        Shared by both the refresh-token path and the browser-login path."""
+        Shared by both the refresh-token path and the browser-login path. When `refresh_token`
+        is given it is persisted atomically with the result row (see db.upsert_student)."""
         t_fetch = time.monotonic()
         yield {"type": "status", "step": "fetch", "message": "Access granted! Fetching academic profile..."}
 
@@ -945,7 +944,8 @@ class DIUHeadlessScraper:
                     overall_cgpa=final_overall_cgpa,
                     total_credits=final_total_credits,
                     completed_credits=final_completed_credits,
-                    semesters=semesters_found
+                    semesters=semesters_found,
+                    refresh_token=refresh_token
                 )
             except Exception as e:
                 print(f"[DB] Error upserting student: {e}")

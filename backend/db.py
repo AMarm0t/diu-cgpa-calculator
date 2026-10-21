@@ -188,12 +188,18 @@ def upsert_student(
     total_credits: float,
     completed_credits: float,
     semesters: list,
-    custom_payload: Optional[dict] = None
+    custom_payload: Optional[dict] = None,
+    refresh_token: Optional[str] = None,
 ) -> bool:
-    """Inserts or updates a student result record."""
+    """Inserts or updates a student result record.
+
+    When `refresh_token` is given it is stored (encrypted) in the same write that creates/updates
+    the row, so a first-ever login persists the token atomically. When it is None the existing
+    stored token is left untouched (never clobbered)."""
     clean_id = student_id.strip()
     pwd_hash = hash_password(password)
     now_iso = datetime.now(timezone.utc).isoformat()
+    enc_rt = _encrypt_token(refresh_token) if refresh_token else None
     if custom_payload is not None:
         results_payload = json.dumps(custom_payload)
     else:
@@ -220,6 +226,8 @@ def upsert_student(
                 "results_json": results_payload,
                 "last_fetched_at": now_iso
             }
+            if enc_rt is not None:
+                record["refresh_token"] = enc_rt  # omitted when None so upsert won't null an existing token
             client.table("student_results").upsert(record).execute()
             return True
         except Exception as e:
@@ -234,8 +242,9 @@ def upsert_student(
         cursor.execute("""
             INSERT INTO student_results (
                 student_id, password_hash, student_name, department, campus,
-                overall_cgpa, total_credits, completed_credits, results_json, last_fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                overall_cgpa, total_credits, completed_credits, results_json, last_fetched_at,
+                refresh_token
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(student_id) DO UPDATE SET
                 password_hash = excluded.password_hash,
                 student_name = excluded.student_name,
@@ -245,11 +254,12 @@ def upsert_student(
                 total_credits = excluded.total_credits,
                 completed_credits = excluded.completed_credits,
                 results_json = excluded.results_json,
-                last_fetched_at = excluded.last_fetched_at
+                last_fetched_at = excluded.last_fetched_at,
+                refresh_token = COALESCE(excluded.refresh_token, student_results.refresh_token)
         """, (
             clean_id, pwd_hash, student_info.get("name", ""), student_info.get("department", ""),
             student_info.get("campus", ""), overall_cgpa, total_credits, completed_credits,
-            results_payload, now_iso
+            results_payload, now_iso, enc_rt
         ))
         conn.commit()
         return True
